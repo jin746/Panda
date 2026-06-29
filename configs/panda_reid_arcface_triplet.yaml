@@ -1,0 +1,138 @@
+# ArcFace + Triplet Loss Enhanced Panda ReID Configuration
+# 专门用于ArcFace+Triplet Loss训练的配置文件
+# 针对24G 4090显卡优化，增强ID特征区分能力
+
+BASE: ['']
+
+DATA:
+  DATASET: 'panda_reid'
+  BATCH_SIZE: 48  # 针对24G显卡优化，为复杂损失计算预留内存
+  IMG_SIZE: 192
+  INTERPOLATION: 'bicubic'
+  ZIP_MODE: False
+  CACHE_MODE: 'part'
+  PIN_MEMORY: True
+  NUM_WORKERS: 8
+
+MODEL:
+  TYPE: 'swinv2'
+  NAME: 'swinv2_large_patch4_window12_192_panda_reid_arcface_triplet'
+  PRETRAINED: ''
+  RESUME: ''
+  DROP_RATE: 0.1           # 增加Dropout防止过拟合
+  ATTN_DROP_RATE: 0.1      # Attention Dropout（与DROP_RATE一致，增强正则）
+  DROP_PATH_RATE: 0.1      # 增加DropPath防止过拟合
+  LABEL_SMOOTHING: 0.1     # 增加标签平滑,提升泛化能力
+
+  # ===== 结构改进：投影瓶颈 + 辅助任务解耦 =====
+  PROJ_DIM: 512            # ReID特征投影维度(瓶颈)，降低过拟合风险；0表示关闭
+  PROJ_DROP: 0.1           # 投影层Dropout
+  AUX_DETACH: True         # 辅助任务梯度不回传到ReID特征/骨干，减少干扰
+
+  NECK_FEAT: 'after'
+  LOSS_TYPE: 'combined'    # 使用增强组合损失: ArcFace+Triplet+Center+Variance
+
+  # ===== 核心改进: 解决阈值敏感性和过拟合问题 =====
+
+  # ArcFace损失参数 - 降低Scale提升稳定性
+  ARCFACE_SCALE: 16.0      # 大幅降低Scale,减少特征空间过度分离 (32.0→16.0)
+  ARCFACE_MARGIN: 0.25     # 降低Margin,给予更多容错空间 (0.3→0.25)
+  ARCFACE_WEIGHT: 0.3      # 降低ArcFace权重,平衡损失 (0.5→0.3)
+
+  # Triplet损失参数 - 降低Margin提升泛化
+  TRIPLET_MARGIN: 0.4      # 降低Margin,避免过度聚合 (0.8→0.4)
+  TRIPLET_WEIGHT: 1.0      # 降低Triplet权重,平衡损失 (2.0→1.0)
+  HARD_MINING: True        # 保持困难样本挖掘
+
+  # Center损失参数 - 稳定特征空间(新增)
+  CENTER_WEIGHT: 0.01      # Center Loss权重,稳定类内聚合
+
+  # Variance损失参数 - 防止特征坍塌(新增)
+  VARIANCE_WEIGHT: 0.001   # Variance Loss权重,保持特征多样性
+
+  # ===== 辅助任务参数 - 性别/年龄预测 =====
+  # 注意: 辅助任务权重不宜过高,避免干扰主任务(ID特征学习)
+
+  # 性别预测参数
+  GENDER_WEIGHT: 0.4       # 性别损失权重 (适中权重,不干扰ID特征)
+  GENDER_LABEL_SMOOTHING: 0.1  # 性别标签平滑,提升泛化能力
+  # 样本不均衡优化：对少数性别样本加权，提升鲁棒性
+  GENDER_USE_CLASS_WEIGHTS: True
+  GENDER_CLASS_WEIGHT_POWER: 0.5   # sqrt(1/freq) 防止权重过大
+  GENDER_CLASS_WEIGHT_CLAMP: 5.0   # 保险上限，避免极端不均衡导致训练不稳
+
+  # 年龄预测参数
+  AGE_WEIGHT: 0.4          # 年龄损失权重 (适中权重,不干扰ID特征)
+  AGE_LOSS_BETA: 1.0       # Huber Loss平滑参数,对异常值更鲁棒
+  # 样本稀疏优化：按年龄bin做加权，提升“稀有年龄段”拟合能力
+  AGE_USE_BIN_WEIGHTS: True
+  AGE_BIN_SIZE: 2.0        # 2岁一个bin（比按单岁更稳，更适合稀疏年龄）
+  AGE_BIN_WEIGHT_POWER: 0.5
+  AGE_BIN_WEIGHT_CLAMP: 5.0
+
+  SWINV2:
+    PATCH_SIZE: 4
+    IN_CHANS: 3
+    EMBED_DIM: 192
+    DEPTHS: [2, 2, 18, 2]
+    NUM_HEADS: [6, 12, 24, 48]
+    WINDOW_SIZE: 12
+    MLP_RATIO: 4.0
+    QKV_BIAS: True
+    APE: False
+    PATCH_NORM: True
+    PRETRAINED_WINDOW_SIZES: [12, 12, 12, 12]
+
+TRAIN:
+  START_EPOCH: 0
+  EPOCHS: 120  # 增加训练轮数，适应更复杂的损失函数
+  WARMUP_EPOCHS: 10  # 增加预热轮数，稳定训练初期
+  WEIGHT_DECAY: 0.01  # 增加权重衰减，防止过拟合
+  BASE_LR: 3e-5  # 进一步降低学习率，适应大scale参数
+  WARMUP_LR: 1e-7
+  MIN_LR: 5e-8  # 降低最小学习率
+  CLIP_GRAD: 1.0  # 增加梯度裁剪，防止大scale导致的梯度爆炸
+  AUTO_RESUME: True
+  ACCUMULATION_STEPS: 1
+  USE_CHECKPOINT: False
+
+  LR_SCHEDULER:
+    NAME: 'cosine'
+    DECAY_EPOCHS: 20
+    DECAY_RATE: 0.1
+    RESTART_EPOCHS: [20, 35]
+    MULTISTEPS: [30, 40]
+    GAMMA: 0.1
+
+  OPTIMIZER:
+    NAME: 'adamw'
+    EPS: 1e-8
+    BETAS: [0.9, 0.999]
+    MOMENTUM: 0.9
+
+AMP_ENABLE: True
+AMP_OPT_LEVEL: ''
+
+OUTPUT: 'output_prototype_arcface_triplet'
+TAG: 'arcface_triplet_enhanced_training'
+SAVE_FREQ: 999
+PRINT_FREQ: 20
+
+EVAL_MODE: True
+
+AUG:
+  COLOR_JITTER: 0.1
+  AUTO_AUGMENT: 'rand-m6-mstd0.3-inc1'
+  REPROB: 0.05
+  REMODE: 'pixel'
+  RECOUNT: 1
+  MIXUP: 0.0
+  CUTMIX: 0.0
+  CUTMIX_MINMAX: ~
+  MIXUP_PROB: 0.0
+  MIXUP_SWITCH_PROB: 0.0
+  MIXUP_MODE: 'batch'
+
+TEST:
+  CROP: True
+  SEQUENTIAL: True
