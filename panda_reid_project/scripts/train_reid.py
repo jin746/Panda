@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """ """
 
@@ -32,17 +32,18 @@ except ImportError:
     SCIPY_AVAILABLE = False
     print("Warning: scipy not available, using fallback for optimal matching")
 
-# 娣诲姞椤圭洰璺緞
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
 
-from config import get_config
-from data.panda_dataset import PandaDataset, build_panda_transform
-from models.panda_reid_model import build_panda_reid_model
-from data.roiimg_dataset import PandaRoiImgDataset  # 鐩存帴璇诲彇ROI瑁佸壀鍥炬暟鎹泦
-from models.prototype_reid_network import PrototypeReIDNetwork, PrototypeLoss
-from models.losses import CombinedLoss  # 瀵煎叆ArcFace+Triplet缁勫悎鎹熷け
-from models.open_world_metrics import compute_open_world_cluster_metrics
-from models.training_multi_prototype import (
+from panda_reid_core.config import get_config
+from panda_reid_core.data.panda_dataset import PandaDataset, build_panda_transform
+from panda_reid_core.models.panda_reid_model import build_panda_reid_model
+from panda_reid_core.data.roiimg_dataset import PandaRoiImgDataset
+from panda_reid_core.models.prototype_reid_network import PrototypeReIDNetwork, PrototypeLoss
+from panda_reid_core.models.losses import CombinedLoss
+from panda_reid_core.models.open_world_metrics import compute_open_world_cluster_metrics
+from panda_reid_core.models.training_multi_prototype import (
     TrainingMultiPrototypeMemory,
     compute_multi_prototype_metric_loss,
     compute_continual_metric_consistency_loss,
@@ -51,10 +52,10 @@ from models.training_multi_prototype import (
     compute_meta_fewshot_topology_loss,
     compute_incremental_topology_stability_loss,
 )
-from optimizer import build_optimizer
-from lr_scheduler import build_scheduler
-from logger import create_logger
-from utils import NativeScalerWithGradNormCount
+from panda_reid_core.optimizer import build_optimizer
+from panda_reid_core.lr_scheduler import build_scheduler
+from panda_reid_core.logger import create_logger
+from panda_reid_core.utils import NativeScalerWithGradNormCount
 import json
 
 
@@ -64,7 +65,7 @@ def _path_for_write(path: str) -> str:
         return path
 
     abs_path = os.path.normpath(os.path.abspath(path))
-    # 缁忛獙闃堝€硷細鎺ヨ繎 260 灏卞鏄撳け璐ワ紙鍚粓姝㈢宸紓锛夛紝鎻愬墠鍒囨崲鍒?long path
+    #
     if len(abs_path) < 250:
         return abs_path
 
@@ -290,7 +291,7 @@ def compute_prototype_aux_loss(
         zero = torch.tensor(0.0, device=device)
         return zero, {'conf_loss': zero, 'qual_loss': zero}
 
-    # 璁＄畻姣忎釜 pid 鐨勫潎鍊煎師鍨?
+    #
     sums = torch.zeros((num_pids, feat_dim), device=device, dtype=features.dtype)
     sums.index_add_(0, inv, features)
     counts = torch.zeros((num_pids,), device=device, dtype=features.dtype)
@@ -298,7 +299,7 @@ def compute_prototype_aux_loss(
     proto_means = sums / counts.unsqueeze(1).clamp(min=1.0)
     proto_means = F.normalize(proto_means, p=2, dim=1)
 
-    # 姣忎釜鏍锋湰鐨勨€滃悓ID鍘熷瀷锛堟帓闄よ嚜韬級鈥濓紝閬垮厤 target 杩囦簬 trivially 楂?
+    #
     sum_per_sample = sums[inv]  # [B, D]
     count_per_sample = counts[inv].unsqueeze(1)  # [B, 1]
     pos_proto = torch.empty_like(features)
@@ -309,12 +310,12 @@ def compute_prototype_aux_loss(
     pos_proto[~multi_mask] = features[~multi_mask]
     pos_proto = F.normalize(pos_proto, p=2, dim=1)
 
-    # 闅忔満璐熷師鍨嬶紙淇濊瘉涓嶅悓 pid锛?
+    #
     rand = torch.randint(low=0, high=num_pids - 1, size=(bsz,), device=device)
     neg_group = rand + (rand >= inv).long()
     neg_proto = proto_means[neg_group]
 
-    # confidence_net锛氫簩鍒嗙被锛堣緭鍑?logits锛岀敤 BCEWithLogitsLoss锛孉MP 瀹夊叏锛?
+    #
     conf_pos_logits = prototype_net.confidence_net(torch.cat([features, pos_proto], dim=1)).squeeze(1).float()
     conf_neg_logits = prototype_net.confidence_net(torch.cat([features, neg_proto], dim=1)).squeeze(1).float()
     conf_loss = 0.5 * (
@@ -322,7 +323,7 @@ def compute_prototype_aux_loss(
         + F.binary_cross_entropy_with_logits(conf_neg_logits, torch.zeros_like(conf_neg_logits))
     )
 
-    # quality_net锛氬洖褰掑悓ID鐩镐技搴︼紙鏄犲皠鍒癧0,1]锛?
+    #
     qual_pred = prototype_net.quality_net(features).squeeze(1).float()
     cos_sim = (features * pos_proto).sum(dim=1).float()  # [-1,1] for normalized
     qual_tgt = ((cos_sim + 1.0) / 2.0).clamp(0.0, 1.0).detach()
@@ -695,7 +696,7 @@ def smart_sample_test_data(test_image_root, target_samples=500, min_samples_per_
     import random
     from collections import defaultdict
 
-    # 1. 鏀堕泦鎵€鏈夋牱鏈苟鎸塈D鍒嗙粍
+    #
     id_samples = defaultdict(list)
     image_extensions = {'.jpg', '.jpeg', '.png', '.bmp'}
 
@@ -704,7 +705,7 @@ def smart_sample_test_data(test_image_root, target_samples=500, min_samples_per_
             if any(file.lower().endswith(ext) for ext in image_extensions):
                 image_path = os.path.join(root, file)
 
-                # 鎻愬彇鐪熷疄ID
+                #
                 true_id = parse_true_id_from_path(image_path, test_image_root)
 
                 id_samples[true_id].append({
@@ -712,13 +713,13 @@ def smart_sample_test_data(test_image_root, target_samples=500, min_samples_per_
                     'true_id': true_id
                 })
 
-    # 2. 杩囨护鎺夋牱鏈暟杩囧皯鐨処D
+    #
     valid_ids = {id_name: samples for id_name, samples in id_samples.items()
                  if len(samples) >= min_samples_per_id}
 
-    # 妫€鏌ユ槸鍚︽弧瓒虫渶灏廔D鏁伴噺瑕佹眰
+    #
     if len(valid_ids) < min_ids:
-        # 闄嶄綆瑕佹眰锛岄噸鏂拌繃婊?
+        #
         min_samples_per_id = max(1, min_samples_per_id - 1)
         valid_ids = {id_name: samples for id_name, samples in id_samples.items()
                      if len(samples) >= min_samples_per_id}
@@ -726,40 +727,40 @@ def smart_sample_test_data(test_image_root, target_samples=500, min_samples_per_
     if not valid_ids:
         return []
 
-    # 3. 璁＄畻閲囨牱绛栫暐
+    #
     total_valid_samples = sum(len(samples) for samples in valid_ids.values())
     num_valid_ids = len(valid_ids)
 
-    # 鍩虹姣廔D閲囨牱鏁?
+    #
     base_samples_per_id = max(min_samples_per_id, target_samples // num_valid_ids)
     base_samples_per_id = min(base_samples_per_id, max_samples_per_id)
 
-    # 4. 鍒嗗眰閲囨牱
+    #
     sampled_data = []
     remaining_quota = target_samples
 
-    # 鎸塈D鏍锋湰鏁版帓搴忥紝浼樺厛閲囨牱鏍锋湰澶氱殑ID
+    #
     sorted_ids = sorted(valid_ids.items(), key=lambda x: len(x[1]), reverse=True)
 
     for id_name, samples in sorted_ids:
         if remaining_quota <= 0:
             break
 
-        # 鍔ㄦ€佽皟鏁撮噰鏍锋暟
+        #
         available_samples = len(samples)
         desired_samples = min(base_samples_per_id, available_samples, remaining_quota)
 
-        # 濡傛灉鏄渶鍚庡嚑涓狪D锛屽彲鑳介渶瑕佸閲囨牱涓€浜?
+        #
         remaining_ids = len([x for x in sorted_ids if x[0] not in [s['true_id'] for s in sampled_data]])
         if remaining_ids <= 3 and remaining_quota > desired_samples:
             desired_samples = min(available_samples, remaining_quota // max(1, remaining_ids))
 
-        # 闅忔満閲囨牱
+        #
         selected_samples = random.sample(samples, desired_samples)
         sampled_data.extend(selected_samples)
         remaining_quota -= desired_samples
 
-    # 5. 濡傛灉杩樻湁鍓╀綑閰嶉锛屼粠鏍锋湰澶氱殑ID涓ˉ鍏?
+    #
     if remaining_quota > 0:
         for id_name, samples in sorted_ids:
             if remaining_quota <= 0:
@@ -773,7 +774,7 @@ def smart_sample_test_data(test_image_root, target_samples=500, min_samples_per_
                     len(samples) - current_count,
                 )
 
-                # 閫夋嫨鏈閲囨牱鐨勬牱鏈?
+                #
                 used_paths = {s['image_path'] for s in sampled_data if s['true_id'] == id_name}
                 unused_samples = [s for s in samples if s['image_path'] not in used_paths]
 

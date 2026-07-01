@@ -52,9 +52,9 @@ def _imread_unicode(path: str) -> Optional[np.ndarray]:
 
 def _normalize_gender_label(raw: str) -> int:
     token = str(raw or "").strip().upper()
-    if token in {"M", "MALE", "雄", "男"}:
+    if token in {"M", "MALE", " ", " "}:
         return 1
-    if token in {"F", "FEMALE", "雌", "女"}:
+    if token in {"F", "FEMALE", " ", " "}:
         return 0
     return 0
 

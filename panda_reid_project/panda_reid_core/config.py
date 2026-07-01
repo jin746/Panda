@@ -468,11 +468,11 @@ def _update_config_from_file(config, cfg_file):
                 config, os.path.join(os.path.dirname(cfg_file), cfg)
             )
     print('=> merge config from {}'.format(cfg_file))
-    # 修复编码问题：手动读取并合并配置
+    #
     try:
         config.merge_from_file(cfg_file)
     except UnicodeDecodeError:
-        # 如果出现编码错误，使用UTF-8重新读取
+        #
         with open(cfg_file, 'r', encoding='utf-8') as f:
             yaml_content = yaml.load(f, Loader=yaml.FullLoader)
         config.merge_from_other_cfg(CN(yaml_content))

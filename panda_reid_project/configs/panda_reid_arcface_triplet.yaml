@@ -1,0 +1,138 @@
+# ArcFace + Triplet Loss Enhanced Panda ReID Configuration
+
+
+
+BASE: ['']
+
+DATA:
+  DATASET: 'panda_reid'
+  BATCH_SIZE: 48
+  IMG_SIZE: 192
+  INTERPOLATION: 'bicubic'
+  ZIP_MODE: False
+  CACHE_MODE: 'part'
+  PIN_MEMORY: True
+  NUM_WORKERS: 8
+
+MODEL:
+  TYPE: 'swinv2'
+  NAME: 'swinv2_large_patch4_window12_192_panda_reid_arcface_triplet'
+  PRETRAINED: ''
+  RESUME: ''
+  DROP_RATE: 0.1
+  ATTN_DROP_RATE: 0.1
+  DROP_PATH_RATE: 0.1
+  LABEL_SMOOTHING: 0.1
+
+
+  PROJ_DIM: 512
+  PROJ_DROP: 0.1
+  AUX_DETACH: True
+
+  NECK_FEAT: 'after'
+  LOSS_TYPE: 'combined'
+
+
+
+
+  ARCFACE_SCALE: 16.0
+  ARCFACE_MARGIN: 0.25
+  ARCFACE_WEIGHT: 0.3
+
+
+  TRIPLET_MARGIN: 0.4
+  TRIPLET_WEIGHT: 1.0
+  HARD_MINING: True
+
+
+  CENTER_WEIGHT: 0.01
+
+
+  VARIANCE_WEIGHT: 0.001
+
+
+
+
+
+  GENDER_WEIGHT: 0.4
+  GENDER_LABEL_SMOOTHING: 0.1
+
+  GENDER_USE_CLASS_WEIGHTS: True
+  GENDER_CLASS_WEIGHT_POWER: 0.5
+  GENDER_CLASS_WEIGHT_CLAMP: 5.0
+
+
+  AGE_WEIGHT: 0.4
+  AGE_LOSS_BETA: 1.0
+
+  AGE_USE_BIN_WEIGHTS: True
+  AGE_BIN_SIZE: 2.0
+  AGE_BIN_WEIGHT_POWER: 0.5
+  AGE_BIN_WEIGHT_CLAMP: 5.0
+
+  SWINV2:
+    PATCH_SIZE: 4
+    IN_CHANS: 3
+    EMBED_DIM: 192
+    DEPTHS: [2, 2, 18, 2]
+    NUM_HEADS: [6, 12, 24, 48]
+    WINDOW_SIZE: 12
+    MLP_RATIO: 4.0
+    QKV_BIAS: True
+    APE: False
+    PATCH_NORM: True
+    PRETRAINED_WINDOW_SIZES: [12, 12, 12, 12]
+
+TRAIN:
+  START_EPOCH: 0
+  EPOCHS: 120
+  WARMUP_EPOCHS: 10
+  WEIGHT_DECAY: 0.01
+  BASE_LR: 3e-5
+  WARMUP_LR: 1e-7
+  MIN_LR: 5e-8
+  CLIP_GRAD: 1.0
+  AUTO_RESUME: True
+  ACCUMULATION_STEPS: 1
+  USE_CHECKPOINT: False
+
+  LR_SCHEDULER:
+    NAME: 'cosine'
+    DECAY_EPOCHS: 20
+    DECAY_RATE: 0.1
+    RESTART_EPOCHS: [20, 35]
+    MULTISTEPS: [30, 40]
+    GAMMA: 0.1
+
+  OPTIMIZER:
+    NAME: 'adamw'
+    EPS: 1e-8
+    BETAS: [0.9, 0.999]
+    MOMENTUM: 0.9
+
+AMP_ENABLE: True
+AMP_OPT_LEVEL: ''
+
+OUTPUT: 'output_prototype_arcface_triplet'
+TAG: 'arcface_triplet_enhanced_training'
+SAVE_FREQ: 999
+PRINT_FREQ: 20
+
+EVAL_MODE: True
+
+AUG:
+  COLOR_JITTER: 0.1
+  AUTO_AUGMENT: 'rand-m6-mstd0.3-inc1'
+  REPROB: 0.05
+  REMODE: 'pixel'
+  RECOUNT: 1
+  MIXUP: 0.0
+  CUTMIX: 0.0
+  CUTMIX_MINMAX: ~
+  MIXUP_PROB: 0.0
+  MIXUP_SWITCH_PROB: 0.0
+  MIXUP_MODE: 'batch'
+
+TEST:
+  CROP: True
+  SEQUENTIAL: True

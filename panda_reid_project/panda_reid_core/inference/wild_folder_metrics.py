@@ -1,9 +1,9 @@
-﻿import json
+import json
 import os
 from collections import Counter, defaultdict
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-from models.open_world_metrics import compute_open_world_cluster_metrics
+from panda_reid_core.models.open_world_metrics import compute_open_world_cluster_metrics
 
 
 def first_folder_of_rel_path(rel_path: Optional[str]) -> Optional[str]:

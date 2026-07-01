@@ -10,10 +10,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.checkpoint as checkpoint
 try:
-    # timm >= 0.9.0 (新版本)
+    #
     from timm.layers import DropPath, to_2tuple, trunc_normal_
 except ImportError:
-    # timm < 0.9.0 (旧版本)
+    #
     from timm.models.layers import DropPath, to_2tuple, trunc_normal_
 import numpy as np
 

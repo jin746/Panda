@@ -1,6 +1,6 @@
 # --------------------------------------------------------
-# 大熊猫个体识别模型
-# 基于Swin Transformer V2 + BNNeck + ID分类
+#
+#
 # --------------------------------------------------------
 
 import torch
@@ -27,16 +27,16 @@ def apply_gradient_ratio(x: torch.Tensor, grad_ratio: float) -> torch.Tensor:
 
 class BNNeck(nn.Module):
     """
-    BatchNorm Neck - 用于特征归一化和分离
-    在ReID任务中，BNNeck可以分离特征学习和分类学习
+    BatchNorm Neck -           
+     ReID    BNNeck             
     """
     
     def __init__(self, in_features: int, num_classes: int, neck_feat: str = 'after'):
         """
         Args:
-            in_features: 输入特征维度
-            num_classes: 分类类别数
-            neck_feat: 'before' 或 'after'，决定返回BN前还是BN后的特征
+            in_features:       
+            num_classes:      
+            neck_feat: 'before'   'after'     BN   BN    
         """
         super(BNNeck, self).__init__()
         
@@ -44,14 +44,14 @@ class BNNeck(nn.Module):
         self.in_features = in_features
         self.num_classes = num_classes
         
-        # BatchNorm层用于特征归一化
+        #
         self.bottleneck = nn.BatchNorm1d(in_features)
-        self.bottleneck.bias.requires_grad_(False)  # 不使用bias
+        self.bottleneck.bias.requires_grad_(False)  #
         
-        # 分类器
+        #
         self.classifier = nn.Linear(in_features, num_classes, bias=False)
         
-        # 初始化
+        #
         self.bottleneck.apply(self._init_weights)
         self.classifier.apply(self._init_weights)
     
@@ -65,7 +65,7 @@ class BNNeck(nn.Module):
             nn.init.constant_(m.bias, 0)
     
     def forward(self, features):
-        """返回 BN 前/后特征与分类得分。"""
+        """   BN  /         """
         feat_before_bn = features
         feat_after_bn = self.bottleneck(features)
         cls_score = self.classifier(feat_after_bn)
@@ -74,8 +74,8 @@ class BNNeck(nn.Module):
 
 class PandaReIDModel(nn.Module):
     """
-    大熊猫个体识别模型
-    基于Swin Transformer V2的特征提取 + BNNeck + ID分类
+             
+      Swin Transformer V2      + BNNeck + ID  
     """
     
     def __init__(
@@ -99,16 +99,16 @@ class PandaReIDModel(nn.Module):
     ):
         """
         Args:
-            num_classes: ID分类数量
-            img_size: 输入图像尺寸
-            embed_dim: 嵌入维度
-            depths: 各层深度
-            num_heads: 各层注意力头数
-            window_size: 窗口大小
-            pretrained_window_sizes: 预训练窗口大小
-            drop_path_rate: DropPath率
-            neck_feat: BNNeck特征选择
-            pretrained_path: 预训练模型路径
+            num_classes: ID    
+            img_size:       
+            embed_dim:     
+            depths:     
+            num_heads:        
+            window_size:     
+            pretrained_window_sizes:        
+            drop_path_rate: DropPath 
+            neck_feat: BNNeck    
+            pretrained_path:        
         """
         super(PandaReIDModel, self).__init__()
         
@@ -123,7 +123,7 @@ class PandaReIDModel(nn.Module):
             img_size=img_size,
             patch_size=4,
             in_chans=3,
-            num_classes=0,  # 不使用原始分类头
+            num_classes=0,  #
             embed_dim=embed_dim,
             depths=depths,
             num_heads=num_heads,
@@ -140,10 +140,10 @@ class PandaReIDModel(nn.Module):
             pretrained_window_sizes=pretrained_window_sizes
         )
         
-        # 获取backbone输出特征维度
+        #
         self.backbone_dim = int(self.backbone.num_features)
 
-        # 可选：投影瓶颈层（降低维度，增强泛化）
+        #
         self.proj = None
         proj_dim = int(proj_dim) if proj_dim is not None else 0
         proj_drop = float(proj_drop) if proj_drop is not None else 0.0
@@ -158,11 +158,11 @@ class PandaReIDModel(nn.Module):
         else:
             self.feature_dim = self.backbone_dim
 
-        # BNNeck + 分类器
+        #
         self.neck = BNNeck(self.feature_dim, num_classes, neck_feat)
 
-        # 优化的多任务侧头：性别分类与年龄回归
-        # 增加网络深度和容量,提升预测精度
+        #
+        #
         self.gender_head = nn.Sequential(
             nn.Linear(self.feature_dim, 512),
             nn.BatchNorm1d(512),
@@ -187,15 +187,15 @@ class PandaReIDModel(nn.Module):
             nn.Linear(256, 1)
         )
 
-        # 初始化辅助头
+        #
         self._init_auxiliary_heads()
 
-        # 加载预训练权重
+        #
         if pretrained_path:
             self.load_pretrained(pretrained_path)
 
     def _init_auxiliary_heads(self):
-        """初始化辅助头的权重"""
+        """         """
         for module in [self.gender_head, self.age_head]:
             for m in module.modules():
                 if isinstance(m, nn.Linear):
@@ -207,11 +207,11 @@ class PandaReIDModel(nn.Module):
                     nn.init.constant_(m.bias, 0)
 
     def load_pretrained(self, pretrained_path: str):
-        """加载预训练权重"""
+        """       """
         try:
             checkpoint = torch.load(pretrained_path, map_location='cpu')
 
-            # 处理不同的checkpoint格式
+            #
             if 'model' in checkpoint:
                 state_dict = checkpoint['model']
             elif 'state_dict' in checkpoint:
@@ -219,14 +219,14 @@ class PandaReIDModel(nn.Module):
             else:
                 state_dict = checkpoint
 
-            # 过滤掉分类头的权重
+            #
             backbone_state_dict = {}
             for k, v in state_dict.items():
                 if k.startswith('head.'):
-                    continue  # 跳过分类头
+                    continue  #
                 backbone_state_dict[k] = v
 
-            # 加载到backbone
+            #
             missing_keys, unexpected_keys = self.backbone.load_state_dict(backbone_state_dict, strict=False)
 
             print(f"Pretrained model loaded: {pretrained_path}")
@@ -240,29 +240,29 @@ class PandaReIDModel(nn.Module):
 
     def forward(self, x, return_features=False):
         """
-        前向传播
+            
 
         Args:
-            x: 输入图像 [B, 3, H, W]
-            return_features: 是否返回中间特征
+            x:      [B, 3, H, W]
+            return_features:         
 
         Returns:
-            如果return_features=False:
-                global_feat: 全局特征 [B, feature_dim]
-                cls_score: 分类得分 [B, num_classes]
-            如果return_features=True:
-                还会返回backbone特征
+              return_features=False:
+                global_feat:      [B, feature_dim]
+                cls_score:      [B, num_classes]
+              return_features=True:
+                    backbone  
         """
-        # 通过backbone提取特征
+        #
         backbone_feat = self.backbone.forward_features(x)  # [B, backbone_dim]
 
-        # 可选投影
+        #
         embed_feat = self.proj(backbone_feat) if self.proj is not None else backbone_feat
 
-        # 通过neck获取最终特征和分类得分
+        #
         feat_before_bn, feat_after_bn, cls_score = self.neck(embed_feat)
 
-        # 与旧行为保持一致：按 neck_feat 返回单一特征
+        #
         global_feat = feat_after_bn if self.neck_feat == 'after' else feat_before_bn
 
         if return_features:
@@ -272,13 +272,13 @@ class PandaReIDModel(nn.Module):
 
     def forward_multitask(self, x):
         """
-        多任务前向（结构改进版）：
-        - 返回 ReID 推理特征(默认 BN 后) + ReID 度量特征(BN 前) + 性别/年龄预测；
-        - 支持 AUX_DETACH：辅助任务梯度不回传到 ReID 特征/骨干，减少干扰。
+                     
+        -    ReID     (   BN  ) + ReID     (BN  ) +   /     
+        -    AUX_DETACH            ReID   /        
 
         Returns:
-            feat_after_bn:  [B, D] ReID推理特征（BN后）
-            feat_before_bn: [B, D] ReID度量特征（BN前，建议用于Triplet）
+            feat_after_bn:  [B, D] ReID     BN  
+            feat_before_bn: [B, D] ReID     BN      Triplet 
             gender_logits:  [B, 2]
             age_pred:       [B]
         """
@@ -297,17 +297,17 @@ class PandaReIDModel(nn.Module):
     
     def extract_features(self, x):
         """
-        仅提取特征，用于推理
+                  
         
         Args:
-            x: 输入图像 [B, 3, H, W]
+            x:      [B, 3, H, W]
             
         Returns:
-            features: 归一化的特征向量 [B, feature_dim]
+            features:          [B, feature_dim]
         """
         with torch.no_grad():
             global_feat, _ = self.forward(x)
-            # L2归一化
+            #
             features = F.normalize(global_feat, p=2, dim=1)
             return features
 
@@ -590,22 +590,22 @@ class TimmPandaReIDModel(nn.Module):
 
 class SimilarityMatchingNetwork(nn.Module):
     """
-    可训练的相似度匹配网络
-    用于学习更好的相似度度量，而不是简单的余弦相似度
+               
+                            
     """
     
     def __init__(self, feature_dim: int, hidden_dim: int = 512):
         """
         Args:
-            feature_dim: 输入特征维度
-            hidden_dim: 隐藏层维度
+            feature_dim:       
+            hidden_dim:      
         """
         super(SimilarityMatchingNetwork, self).__init__()
         
         self.feature_dim = feature_dim
         self.hidden_dim = hidden_dim
         
-        # 特征变换网络
+        #
         self.feature_transform = nn.Sequential(
             nn.Linear(feature_dim, hidden_dim),
             nn.ReLU(inplace=True),
@@ -616,18 +616,18 @@ class SimilarityMatchingNetwork(nn.Module):
             nn.Linear(hidden_dim, feature_dim)
         )
         
-        # 相似度计算网络
-        # 输入维度：concat(2*feature_dim) + product(feature_dim) + diff(feature_dim) = 4*feature_dim
-        # 注意：移除Sigmoid，使用BCEWithLogitsLoss
+        #
+        #
+        #
         self.similarity_net = nn.Sequential(
-            nn.Linear(feature_dim * 4, hidden_dim),  # 修正：4倍特征维度
+            nn.Linear(feature_dim * 4, hidden_dim),  #
             nn.ReLU(inplace=True),
             nn.Dropout(0.1),
             nn.Linear(hidden_dim, hidden_dim // 2),
             nn.ReLU(inplace=True),
             nn.Dropout(0.1),
             nn.Linear(hidden_dim // 2, 1)
-            # 移除Sigmoid，改用BCEWithLogitsLoss
+            #
         )
         
         self.apply(self._init_weights)
@@ -640,32 +640,32 @@ class SimilarityMatchingNetwork(nn.Module):
     
     def forward(self, feat1, feat2):
         """
-        计算两个特征之间的相似度
+                    
         
         Args:
-            feat1: 特征1 [B, feature_dim]
-            feat2: 特征2 [B, feature_dim]
+            feat1:   1 [B, feature_dim]
+            feat2:   2 [B, feature_dim]
             
         Returns:
-            similarity: 相似度得分 [B, 1]
+            similarity:       [B, 1]
         """
-        # 特征变换
+        #
         feat1_trans = self.feature_transform(feat1)
         feat2_trans = self.feature_transform(feat2)
         
-        # 归一化
+        #
         feat1_norm = F.normalize(feat1_trans, p=2, dim=1)
         feat2_norm = F.normalize(feat2_trans, p=2, dim=1)
         
-        # 多种相似度特征
-        concat_feat = torch.cat([feat1_norm, feat2_norm], dim=1)  # 拼接
-        product_feat = feat1_norm * feat2_norm  # 逐元素乘积
-        diff_feat = torch.abs(feat1_norm - feat2_norm)  # 绝对差值
+        #
+        concat_feat = torch.cat([feat1_norm, feat2_norm], dim=1)  #
+        product_feat = feat1_norm * feat2_norm  #
+        diff_feat = torch.abs(feat1_norm - feat2_norm)  #
         
-        # 组合特征
+        #
         combined_feat = torch.cat([concat_feat, product_feat, diff_feat], dim=1)
         
-        # 计算相似度
+        #
         similarity = self.similarity_net(combined_feat)
         
         return similarity
@@ -673,14 +673,14 @@ class SimilarityMatchingNetwork(nn.Module):
 
 def build_panda_reid_model(config, num_classes: int):
     """
-    构建大熊猫ReID模型
+         ReID  
     
     Args:
-        config: 配置对象
-        num_classes: ID分类数量
+        config:     
+        num_classes: ID    
         
     Returns:
-        model: PandaReIDModel实例
+        model: PandaReIDModel  
     """
     model_type = str(getattr(config.MODEL, "TYPE", "swinv2")).lower()
 
@@ -733,13 +733,13 @@ def build_panda_reid_model(config, num_classes: int):
 
 
 if __name__ == "__main__":
-    # 测试模型
+    #
     model = PandaReIDModel(num_classes=42, img_size=192)
     
-    # 测试输入
+    #
     x = torch.randn(2, 3, 192, 192)
     
-    # 前向传播
+    #
     global_feat, cls_score = model(x)
     print(f"Global feature shape: {global_feat.shape}")
     print(f"Classification score shape: {cls_score.shape}")

@@ -16,35 +16,32 @@ class YOLO26RuntimeEnv:
 
 
 def bootstrap_local_yolo26_runtime(project_root: str) -> YOLO26RuntimeEnv:
-    """Load YOLO26 backend strictly from local vendor under project root."""
+    """Resolve YOLO runtime without requiring vendored code in git."""
     proj = os.path.abspath(str(project_root))
     vendor_root = os.path.join(proj, "third_party", "ultralytics_yolo26")
     pkg_root = os.path.join(vendor_root, "ultralytics")
-    if not os.path.isdir(pkg_root):
-        raise FileNotFoundError(f"Local YOLO26 vendor not found: {pkg_root}")
 
-    if vendor_root not in sys.path:
+    if os.path.isdir(pkg_root) and vendor_root not in sys.path:
         sys.path.insert(0, vendor_root)
 
-    from ultralytics import YOLO
-    import ultralytics as ultralytics_pkg
-
-    ultralytics_file = str(getattr(ultralytics_pkg, "__file__", "") or "")
-    ultralytics_version = str(getattr(ultralytics_pkg, "__version__", "unknown") or "unknown")
-    ultra_root = os.path.dirname(ultralytics_file)
-    marker = os.path.join(ultra_root, "cfg", "models", "26", "yolo26.yaml")
-    if not os.path.isfile(marker):
-        raise RuntimeError(
-            "Loaded ultralytics backend is not YOLO26-capable: "
-            f"{ultralytics_file}. Expected marker not found: {marker}"
-        )
+    try:
+        from ultralytics import YOLO
+        import ultralytics as ultralytics_pkg
+    except Exception:
+        YOLO = None
+        ultralytics_file = ""
+        ultralytics_version = "unavailable"
+    else:
+        ultralytics_file = str(getattr(ultralytics_pkg, "__file__", "") or "")
+        ultralytics_version = str(getattr(ultralytics_pkg, "__version__", "unknown") or "unknown")
 
     default_weight = os.path.abspath(
-        os.path.join(proj, "output", "model", "yolo26", "panda_yolo26s_aug_best.pt")
+        os.path.join(proj, "weights", "panda_yolo26s_aug_best.pt")
     )
-    default_tracker = os.path.abspath(
-        os.path.join(vendor_root, "ultralytics", "cfg", "trackers", "bytetrack.yaml")
-    )
+    default_tracker = os.path.join(vendor_root, "ultralytics", "cfg", "trackers", "bytetrack.yaml")
+    if not os.path.isfile(default_tracker):
+        default_tracker = ""
+
     return YOLO26RuntimeEnv(
         project_root=proj,
         vendor_root=os.path.abspath(vendor_root),
@@ -97,13 +94,23 @@ def build_yolo_detector(args, env: YOLO26RuntimeEnv, verbose: bool = True):
     if not det_model:
         raise ValueError("detector model path is empty")
 
+    yolo_class = env.yolo_class
+    if yolo_class is None:
+        try:
+            from ultralytics import YOLO as yolo_class
+        except Exception as exc:
+            raise ImportError(
+                "Ultralytics is required for detector inference. Install it or provide "
+                "a local third_party/ultralytics_yolo26 runtime."
+            ) from exc
+
     ext = os.path.splitext(str(det_model))[1].lower()
     if ext in {".pt", ".onnx", ".engine", ".tflite", ".xml", ".yaml", ".yml"}:
         has_sep = (os.path.sep in str(det_model)) or ("/" in str(det_model)) or ("\\" in str(det_model))
         if (os.path.isabs(str(det_model)) or has_sep) and not os.path.exists(str(det_model)):
             raise FileNotFoundError(f"Detector weights/model not found: {det_model}")
 
-    yolo = env.yolo_class(str(det_model))
+    yolo = yolo_class(str(det_model))
     if verbose:
         src = str(env.ultralytics_file).replace("/", "\\")
         print(f"[INFO] Ultralytics backend: version={env.ultralytics_version}, module={src}")
@@ -112,4 +119,3 @@ def build_yolo_detector(args, env: YOLO26RuntimeEnv, verbose: bool = True):
         if tracker_cfg:
             print(f"[INFO] Tracker cfg: {tracker_cfg}")
     return yolo
-

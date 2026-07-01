@@ -13,10 +13,14 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
-from config import get_config
-from data.roiimg_dataset import PandaRoiImgDataset
-from models.panda_reid_model import build_panda_reid_model
-from train_age_gender_specialist import (
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+
+from panda_reid_core.config import get_config
+from panda_reid_core.data.roiimg_dataset import PandaRoiImgDataset
+from panda_reid_core.models.panda_reid_model import build_panda_reid_model
+from scripts.train_age_gender import (
     build_balanced_sampler,
     build_eval_transform,
     build_scheduler,

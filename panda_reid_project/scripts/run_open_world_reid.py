@@ -1,10 +1,9 @@
-﻿import os 
+import os 
 import sys 
 import cv2 
 import argparse 
 import atexit 
 import time 
-import json 
 from collections import defaultdict ,deque 
 import numpy as np 
 import torch 
@@ -15,16 +14,22 @@ import shutil
 from typing import Optional 
 
 _THIS_DIR =os .path .dirname (os .path .abspath (__file__ ))
-sys .path .append (_THIS_DIR )
+PROJECT_ROOT =os .path .dirname (_THIS_DIR )
+if PROJECT_ROOT not in sys .path :
+    sys .path .insert (0 ,PROJECT_ROOT )
 
-from inference_modules .yolo26_backend import (
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+
+from panda_reid_core.inference.yolo26_backend import (
 bootstrap_local_yolo26_runtime ,
 build_yolo_detector as _build_yolo26_detector_impl ,
 resolve_detector_runtime_paths as _resolve_yolo26_runtime_paths_impl ,
 resolve_existing_path as _resolve_existing_path_impl ,
 )
 
-_YOLO26_RUNTIME =bootstrap_local_yolo26_runtime (_THIS_DIR )
+_YOLO26_RUNTIME =bootstrap_local_yolo26_runtime (PROJECT_ROOT )
 _YOLO26_IMPORT_ROOT =_YOLO26_RUNTIME .vendor_root 
 _YOLO26_LOCAL_VENDOR =_YOLO26_RUNTIME .vendor_root 
 _YOLO26_LOCAL_WEIGHT =_YOLO26_RUNTIME .default_weight 
@@ -32,51 +37,40 @@ _YOLO26_LOCAL_TRACKER =_YOLO26_RUNTIME .default_tracker
 _ULTRALYTICS_VERSION =_YOLO26_RUNTIME .ultralytics_version 
 _ULTRALYTICS_FILE =_YOLO26_RUNTIME .ultralytics_file 
 
-from inference_modules .panda_reid_inference import PandaReIDInference 
-from models .panda_reid_model import build_panda_reid_model 
-from train_age_gender_specialist import AgeGenderSpecialist 
+from panda_reid_core.inference.panda_reid_inference import PandaReIDInference 
+from panda_reid_core.models.panda_reid_model import build_panda_reid_model 
+from scripts.train_age_gender import AgeGenderSpecialist 
 # SAM (Segment Anything) 
 try :
-    from segment_anything import sam_model_registry ,SamPredictor  
+    from panda_reid_core.segment_anything import sam_model_registry ,SamPredictor  
     _HAS_SAM =True 
 except Exception :
     _HAS_SAM =False 
 
-from analyze_population import build_infer_args_for_inference 
-from config import get_config 
-from inference_modules.wild_folder_metrics import save_folder_level_metrics 
-
-# Manual visualization remapping:
-# Edit only these two dicts when you want to merge/rename displayed IDs.
-# Example below means detected ID1 and ID2 are shown as the same displayed ID1.
-MANUAL_VIS_ID_ALIAS ={
-"ID1":"ID1",
-"ID2":"ID1",
-# "ID3":"ID1",
-# "ID4":"ID2",
-}
-
-# Optional full-text override used for visualization/export.
-# Keys can be either the raw detected ID or the merged display ID above.
-MANUAL_VIS_TEXT ={
-# "ID1":"ID1 M conf0.78 Age 12 idconf 0.99",
-# "ID2":"ID1 M conf0.78 Age 12 idconf 0.99",
-}
-
-DEFAULT_VIS_TEXT_TEMPLATE ="{id} | {gender}_conf:{gender_conf:.2f} | Age:{age_text} | id_conf:{id_conf:.2f}"
+from panda_reid_core.runtime_args import build_infer_args_for_inference 
+from panda_reid_core.config import get_config 
+from panda_reid_core.inference.wild_folder_metrics import save_folder_level_metrics 
+from panda_reid_core.inference.prototype_strategies import (
+IdentityPrototypeBank ,
+cluster_embeddings_multiproto ,
+)
 
 # ===== User-tunable defaults =====
 USER_DEFAULTS ={
 # Input / Output
-'input':r"H:\自制数据集\video2",
-'output':r"E:\pythonProjrct\panda\Swin-Transformer-main-reid20260104SAMVideo\output\infer_openworld_best",
+'input':'',
+'output':'outputs/open_world',
 
 # Best available deployment in current workspace (final default after 2026-03-12 comparison):
-# - ReID: output_transfer_oldstrong_trainonly_10ep_aligned/prototype_best_model.pth
+# - Video ReID: output_transfer_oldstrong_trainonly_10ep_aligned/prototype_best_model.pth
+# - Image ReID (macro-best across testsets 1..5): output_transfer_oldstrong_trainonly_10ep_aligned/prototype_best_model.pth
+# - Image fallback candidate (better on some count-sensitive sets): prototype_epoch_004.pth
 # - Aux(age/gender): output_Model_20260102/prototype_best_model.pth
-'cfg':r"E:\pythonProjrct\panda\Swin-Transformer-main-reid20260104SAMVideo\configs\panda_reid_arcface_triplet.yaml",
-'model_path':r"E:\pythonProjrct\panda\Swin-Transformer-main-reid20260104SAMVideo\output\model\output_transfer_oldstrong_trainonly_10ep_aligned\swinv2_large_patch4_window12_192_panda_reid_arcface_triplet\arcface_triplet_enhanced_training\prototype_best_model.pth",
-'aux_model_path':r"E:\pythonProjrct\panda\Swin-Transformer-main-reid20260104SAMVideo\output\model\output_Model_20260102\swinv2_large_patch4_window12_192_panda_reid_arcface_triplet\arcface_triplet_enhanced_training\prototype_best_model.pth",
+'cfg':'configs/panda_reid_arcface_triplet.yaml',
+'model_path':'weights/reid_model.pth',
+'video_model_path':'weights/reid_model.pth',
+'image_model_path':'weights/reid_model.pth',
+'aux_model_path':'weights/age_gender_model.pth',
 
 # Matching
 'mode':'custom',
@@ -97,7 +91,13 @@ USER_DEFAULTS ={
 'aux_gender_penalty':0.15 ,
 'aux_age_reweight':0.10 ,
 'aux_min_age_sigma':2.0 ,
-'aux_feature_fuse_weight':0.0 ,
+'aux_feature_fuse_weight':0.2 ,
+'prototype_strategy':'single' ,
+'prototype_max_slots':4 ,
+'prototype_spawn_similarity':0.68 ,
+'prototype_update_similarity':0.58 ,
+'prototype_topk':2 ,
+'prototype_aggregate_weight':0.75 ,
 
 # Detection / tracking
 'yolo_repo_root':_YOLO26_LOCAL_VENDOR ,
@@ -110,6 +110,7 @@ USER_DEFAULTS ={
 'roi_vis_det_conf':0.35 ,
 'roi_vis_det_iou':0.45 ,
 'sec_interval':1.0 ,
+'vid_stride':1 ,
 'max_keep_missing_sec':5.0 ,
 
 # Runtime
@@ -136,7 +137,10 @@ USER_DEFAULTS ={
 'twopass_threshold':0.22 ,
 'twopass_threshold_auto':True ,
 'twopass_fuse_full_image':True ,
-'twopass_full_image_weight':0.05 ,
+'twopass_full_image_weight':0.35 ,
+'twopass_cluster_aux_reid_weight':0.30 ,
+'twopass_cluster_aux_gender_weight':0.10 ,
+'twopass_cluster_aux_age_weight':0.05 ,
 'twopass_auto_merge':False ,
 'twopass_target_cluster_size':26.0 ,
 'twopass_merge_min_sim':0.50 ,
@@ -144,17 +148,34 @@ USER_DEFAULTS ={
 'twopass_refine_min_size':18 ,
 'twopass_refine_delta':0.08 ,
 'twopass_refine_min_subcluster':4 ,
+'twopass_centroid_merge':True ,
+'twopass_centroid_image_only':True ,
+'twopass_centroid_min_fragments':128 ,
+'twopass_centroid_method':'agglomerative',
+'twopass_centroid_threshold_auto':True ,
+'twopass_centroid_threshold':0.18 ,
+'twopass_centroid_fragment_group_size':16.0 ,
+'twopass_centroid_auto_merge':False ,
+'twopass_centroid_merge_min_sim':0.40 ,
+
+# Conservative post-merge to reduce over-splitting without collapsing different IDs.
+'post_merge_enable':True ,
+'post_merge_enable_video':True ,
+'post_merge_enable_image':False ,
+'post_merge_video_min_sim':0.41 ,
+'post_merge_image_min_sim':0.56 ,
+'post_merge_mixed_min_sim':0.52 ,
+'post_merge_gender_conf_guard':0.80 ,
+'post_merge_age_gap_soft':3.0 ,
+'post_merge_age_gap_hard':6.0 ,
+'post_merge_fragment_relax':0.04 ,
+'post_merge_tiny_image_max_size':3 ,
+'post_merge_tiny_image_min_sim':0.44 ,
 
 # Output layout
 'save_vis':True ,
 'group_by_id':True ,
 'image_as_roi':0 ,
-
-# Manual visualization customization in code
-'vis_id_alias':MANUAL_VIS_ID_ALIAS ,
-'vis_manual_text':MANUAL_VIS_TEXT ,
-'vis_id_prefix':'' ,
-'vis_text_template':DEFAULT_VIS_TEXT_TEMPLATE ,
 }
 # ===============================================
 
@@ -309,245 +330,725 @@ def _gender_confidence_01 (male_prob ,stable_gender =None ,threshold =0.5 )->flo
     return _clamp01 (_sigmoid01 (pred_prob -0.5 ,temperature =0.10 ),default =0.5 )
 
 
-def _parse_vis_id_alias_map (alias_value )->dict :
-    """Accept dict / JSON / inline pairs for manual display remapping."""
-    if alias_value is None :
-        return {}
-    if isinstance (alias_value ,dict ):
-        out ={}
-        for k ,v in alias_value .items ():
-            ks =str (k ).strip ()
-            vs =str (v ).strip ()
-            if ks :
-                out [ks ]=vs 
-        return out 
-    s =str (alias_value ).strip ()
-    if s =='':
-        return {}
-    if os .path .isfile (s ):
-        try :
-            with open (s ,'r',encoding ='utf-8')as f :
-                obj =json .load (f )
-            if isinstance (obj ,dict ):
-                return _parse_vis_id_alias_map (obj )
-        except Exception :
-            return {}
-    if s .startswith ('{')and s .endswith ('}'):
-        try :
-            obj =json .loads (s )
-            if isinstance (obj ,dict ):
-                return _parse_vis_id_alias_map (obj )
-        except Exception :
-            pass 
-    out ={}
-    for seg in s .split (','):
-        part =str (seg ).strip ()
-        if not part :
-            continue 
-        if '='in part :
-            k ,v =part .split ('=',1 )
-        elif ':'in part :
-            k ,v =part .split (':',1 )
-        else :
-            continue 
-        ks =str (k ).strip ()
-        vs =str (v ).strip ()
-        if ks :
-            out [ks ]=vs 
-    return out 
-
-
-def _customize_disp_id (disp_id :str ,args )->str :
-    raw =str (disp_id )if disp_id is not None else ''
-    alias_map =getattr (args ,'_vis_id_alias_map',{})or {}
-    if raw in alias_map :
-        return str (alias_map [raw ])
-    prefix =str (getattr (args ,'vis_id_prefix','')or '').strip ()
-    if prefix and _is_canonical_id_name (raw ):
-        try :
-            return f"{prefix}{int(raw[2:])}"
-        except Exception :
-            return f"{prefix}{raw}"
-    return raw 
-
-
-def _resolve_display_id (global_to_display :dict ,gid :str ,args ,fallback_to_gid =False )->str :
-    raw ='' 
-    if isinstance (global_to_display ,dict )and gid in global_to_display :
-        raw =global_to_display .get (gid ,'')or ''
-    elif fallback_to_gid and _is_canonical_id_name (gid ):
-        raw =str (gid )
-    return _customize_disp_id (raw ,args )
-
-
-def _build_vis_text (
-*,
-args ,
-disp_id :str ,
-gender :Optional [str ]=None ,
-gender_conf :Optional [float ]=None ,
-age :Optional [float ]=None ,
-id_conf :Optional [float ]=None ,
-):
-    """Build final text after applying manual ID alias / manual text override."""
-    raw_id =str (disp_id )if disp_id is not None else ''
-    custom_id =_customize_disp_id (raw_id ,args )
-    manual_map =getattr (args ,'_vis_manual_text_map',{})or {}
-    if custom_id in manual_map :
-        return str (manual_map [custom_id ])
-    if raw_id in manual_map :
-        return str (manual_map [raw_id ])
-    g =str (gender )if gender is not None else '-'
-    gc =float (gender_conf )if gender_conf is not None else 0.0 
-    ic =float (id_conf )if id_conf is not None else 0.0 
-    age_text ='-'
-    age_value =0.0 
-    if age is not None :
-        age_value =float (age )
-        age_text =f"{age_value:.0f}"
-    tpl =str (getattr (args ,'vis_text_template',DEFAULT_VIS_TEXT_TEMPLATE )or DEFAULT_VIS_TEXT_TEMPLATE ).strip ()
+def _display_id_sort_key (display_id :str ):
     try :
-        return tpl .format (
-        id =custom_id ,
-        raw_id =raw_id ,
-        gender =g ,
-        gender_conf =gc ,
-        age =age_value ,
-        age_text =age_text ,
-        id_conf =ic ,
-        )
-    except Exception :
-        return f"{custom_id} | {g}_conf:{gc:.2f} | Age:{age_text} | id_conf:{ic:.2f}"
-
-
-def _sort_display_id_key (x :str ):
-    try :
-        if _is_canonical_id_name (x ):
-            return (0 ,int (x [2 :]))
+        s =str (display_id )
+        if _is_canonical_id_name (s ):
+            return (0 ,int (s [2 :]))
     except Exception :
         pass 
-    return (1 ,str (x ))
+    return (1 ,str (display_id ))
 
 
-def _aggregate_age_value (age_values ,args ):
-    vals =[]
-    for age in age_values or []:
+def _normalize_np_feature (feat )->Optional [np .ndarray ]:
+    if feat is None :
+        return None 
+    try :
+        arr =np .asarray (feat ,dtype =np .float32 ).reshape (-1 )
+    except Exception :
+        return None 
+    if arr .size ==0 :
+        return None 
+    norm =float (np .linalg .norm (arr ))
+    if norm <=1e-12 :
+        return None 
+    return arr /norm 
+
+
+def _fused_similarity_np (feat_a ,feat_b ,w_cos =0.7 ,w_euc =0.3 )->float :
+    a =_normalize_np_feature (feat_a )
+    b =_normalize_np_feature (feat_b )
+    if a is None or b is None :
+        return -1.0 
+    cosine_sim =float (np .dot (a ,b ))
+    euclidean_dist =float (np .linalg .norm (a -b ))
+    euclidean_sim =1.0 /(1.0 +euclidean_dist )
+    denom =max (1e-6 ,float (w_cos )+float (w_euc ))
+    w_cos =float (w_cos )/denom 
+    w_euc =float (w_euc )/denom 
+    return float (w_cos *cosine_sim +w_euc *euclidean_sim )
+
+
+def _merge_grouped_output_folders (id_root :Optional [str ],src_disp_id :str ,dst_disp_id :str ):
+    if not id_root :
+        return 
+    src_dir =os .path .join (id_root ,str (src_disp_id ))
+    dst_dir =os .path .join (id_root ,str (dst_disp_id ))
+    if not os .path .isdir (src_dir )or src_dir ==dst_dir :
+        return 
+    os .makedirs (dst_dir ,exist_ok =True )
+    for item in os .listdir (src_dir ):
+        src_path =os .path .join (src_dir ,item )
+        dst_path =os .path .join (dst_dir ,item )
+        if os .path .exists (dst_path ):
+            base ,ext =os .path .splitext (item )
+            dst_path =os .path .join (dst_dir ,f"{base}__merged_from_{src_disp_id}{ext}")
+        shutil .move (src_path ,dst_path )
+    try :
+        if len (os .listdir (src_dir ))==0 :
+            os .rmdir (src_dir )
+    except Exception :
+        pass 
+
+
+def _identity_conflict_pairs_store (inference ):
+    store =getattr (inference ,'_identity_conflict_pairs',None )
+    if store is None :
+        store =set ()
+        setattr (inference ,'_identity_conflict_pairs',store )
+    return store 
+
+
+def _identity_gid_sources_store (inference ):
+    store =getattr (inference ,'_identity_gid_sources',None )
+    if store is None :
+        store =defaultdict (set )
+        setattr (inference ,'_identity_gid_sources',store )
+    return store 
+
+
+def _identity_gid_kinds_store (inference ):
+    store =getattr (inference ,'_identity_gid_kinds',None )
+    if store is None :
+        store =defaultdict (set )
+        setattr (inference ,'_identity_gid_kinds',store )
+    return store 
+
+
+def _identity_gid_features_store (inference ):
+    store =getattr (inference ,'_identity_gid_features',None )
+    if store is None :
+        store ={}
+        setattr (inference ,'_identity_gid_features',store )
+    return store 
+
+
+def _ensure_identity_bank (inference ,args ):
+    strategy =str (getattr (args ,'prototype_strategy','single')or 'single').lower ()
+    if strategy =='single':
+        return None 
+    bank =getattr (inference ,'identity_bank',None )
+    needs_new =(
+    bank is None 
+    or str (getattr (bank ,'strategy','single')or 'single').lower ()!=strategy 
+    )
+    if needs_new :
+        bank =IdentityPrototypeBank (
+        strategy =strategy ,
+        momentum =float (getattr (args ,'cluster_momentum',0.9 )or 0.9 ),
+        max_slots =int (getattr (args ,'prototype_max_slots',4 )or 4 ),
+        spawn_similarity =float (getattr (args ,'prototype_spawn_similarity',0.68 )or 0.68 ),
+        update_similarity =float (getattr (args ,'prototype_update_similarity',0.58 )or 0.58 ),
+        topk =int (getattr (args ,'prototype_topk',2 )or 2 ),
+        aggregate_weight =float (getattr (args ,'prototype_aggregate_weight',0.75 )or 0.75 ),
+        sim_cosine_w =float (getattr (args ,'sim_cosine_w',0.7 )or 0.7 ),
+        sim_euclid_w =float (getattr (args ,'sim_euclid_w',0.3 )or 0.3 ),
+        aux_gender_penalty =float (getattr (args ,'aux_gender_penalty',0.15 )or 0.15 ),
+        aux_age_reweight =float (getattr (args ,'aux_age_reweight',0.10 )or 0.10 ),
+        aux_min_age_sigma =float (getattr (args ,'aux_min_age_sigma',2.0 )or 2.0 ),
+        )
+        setattr (inference ,'identity_bank',bank )
+    return bank 
+
+
+def _prototype_quality_score (inference ,feature )->float :
+    pn =getattr (inference ,'prototype_net',None )
+    if pn is None :
+        return 1.0 
+    try :
+        with torch .no_grad ():
+            q =F .normalize (feature .float ().flatten (),p =2 ,dim =0 )
+            return float (pn .quality_net (q .unsqueeze (0 )).item ())
+    except Exception :
+        return 1.0 
+
+
+def _prototype_pair_confidence (inference ,query_feature ,proto_feature )->float :
+    pn =getattr (inference ,'prototype_net',None )
+    if pn is None or proto_feature is None :
+        return 0.0 
+    try :
+        with torch .no_grad ():
+            q =F .normalize (query_feature .float ().flatten (),p =2 ,dim =0 )
+            p =F .normalize (proto_feature .to (q .device ).float ().flatten (),p =2 ,dim =0 )
+            logits =pn .confidence_net (torch .cat ([q ,p ],dim =0 ).unsqueeze (0 )).squeeze (1 )
+            return float (torch .sigmoid (logits ).item ())
+    except Exception :
+        return 0.0 
+
+
+def _match_identity_with_strategy (inference ,feature ,*,aux =None ,reserved_ids =None ,candidate_ids =None ,allow_new =True ):
+    args =getattr (inference ,'args',None )
+    strategy =str (getattr (args ,'prototype_strategy','single')or 'single').lower ()if args is not None else 'single'
+    q =F .normalize (feature .float ().flatten (),p =2 ,dim =0 )
+    if strategy =='single':
+        pn =getattr (inference ,'prototype_net',None )
+        if pn is None :
+            return {
+            'predicted_id':None ,
+            'similarity':0.0 ,
+            'confidence':0.0 ,
+            'is_new_id':True ,
+            'adaptive_threshold':float (getattr (inference ,'similarity_threshold',0.5 )or 0.5 ),
+            'all_similarities':{} ,
+            'quality_score':1.0 ,
+            }
+        if candidate_ids :
+            return pn (q ,known_ids =[str (x )for x in candidate_ids if x ],aux =aux )
+        return pn (q ,aux =aux )
+
+    bank =_ensure_identity_bank (inference ,args )
+    pn =getattr (inference ,'prototype_net',None )
+    if pn is not None :
         try :
-            vals .append (float (age ))
+            pn .update_global_stats (q .unsqueeze (0 ))
         except Exception :
             pass 
-    if not vals :
-        return None 
-    mode =str (getattr (args ,'age_display','median')or 'median').lower ()
-    if mode =='mean':
-        return float (np .mean (vals ))
-    return float (np .median (vals ))
+    adaptive_th =float (getattr (inference ,'similarity_threshold',0.5 )or 0.5 )
+    if pn is not None :
+        try :
+            adaptive_th =float (pn .compute_adaptive_threshold (q ))
+        except Exception :
+            pass 
+    quality_score =_prototype_quality_score (inference ,q )
+    match =None if bank is None else bank .match (
+    q ,
+    candidate_ids =candidate_ids ,
+    reserved_ids =reserved_ids ,
+    aux =aux ,
+    )
+    if match is None :
+        if not allow_new :
+            return {
+            'predicted_id':None ,
+            'similarity':0.0 ,
+            'confidence':0.0 ,
+            'is_new_id':True ,
+            'adaptive_threshold':adaptive_th ,
+            'all_similarities':{} ,
+            'quality_score':quality_score ,
+            }
+        inference .wild_id_counter +=1 
+        return {
+        'predicted_id':f"Wild_Panda_{inference .wild_id_counter:03d}" ,
+        'similarity':1.0 ,
+        'confidence':quality_score ,
+        'is_new_id':True ,
+        'adaptive_threshold':adaptive_th ,
+        'all_similarities':{} ,
+        'quality_score':quality_score ,
+        }
+
+    best_id =str (match .get ('gid'))
+    best_similarity =float (match .get ('score',0.0 )or 0.0 )
+    second_best =float (match .get ('second_identity_score',-1.0 )or -1.0 )
+    best_proto_feat =match .get ('best_feature',None )
+    best_conf =_prototype_pair_confidence (inference ,q ,best_proto_feat )
+    sim_margin =best_similarity -second_best if second_best >=-0.5 else 1.0 
+    conf_th =float (getattr (args ,'confidence_threshold',0.0 )or 0.0 )if args is not None else 0.0 
+    quality_th =float (getattr (args ,'quality_threshold',0.0 )or 0.0 )if args is not None else 0.0 
+    ambiguous_margin =float (getattr (pn ,'ambiguous_margin',0.03 )or 0.03 )if pn is not None else 0.03 
+    ambiguous_offset =float (getattr (pn ,'ambiguous_offset',0.02 )or 0.02 )if pn is not None else 0.02 
+    similarity_gate =best_similarity <adaptive_th 
+    confidence_gate =best_conf <conf_th 
+    quality_gate =quality_score <quality_th 
+    ambiguous_gate =(sim_margin <ambiguous_margin and best_similarity <adaptive_th +ambiguous_offset )
+    is_new_id =bool (similarity_gate and (confidence_gate or quality_gate or ambiguous_gate ))
+    if is_new_id and allow_new :
+        inference .wild_id_counter +=1 
+        predicted_id =f"Wild_Panda_{inference .wild_id_counter:03d}"
+    elif is_new_id :
+        predicted_id =None 
+    else :
+        predicted_id =best_id 
+    return {
+    'predicted_id':predicted_id ,
+    'similarity':best_similarity ,
+    'confidence':best_conf ,
+    'is_new_id':bool (is_new_id ),
+    'adaptive_threshold':adaptive_th ,
+    'all_similarities':match .get ('all_similarities',{})or {} ,
+    'quality_score':quality_score ,
+    'debug_info':{
+    'best_similarity':best_similarity ,
+    'adaptive_threshold':adaptive_th ,
+    'best_confidence':best_conf ,
+    'confidence_threshold':conf_th ,
+    'quality_score':quality_score ,
+    'quality_threshold':quality_th ,
+    'sim_margin':sim_margin ,
+    'num_prototypes':0 if bank is None else len (bank .ids ()),
+    },
+    }
 
 
-def _aggregate_display_identity_summary (
+def _update_identity_memory (inference ,gid ,feature ,quality_score ,*,gender_prob =None ,age_pred =None ,id_conf =None ):
+    if gid is None :
+        return 
+    q =F .normalize (feature .float ().flatten (),p =2 ,dim =0 )
+    args =getattr (inference ,'args',None )
+    bank =None if args is None else _ensure_identity_bank (inference ,args )
+    if bank is not None :
+        try :
+            bank .update (
+            str (gid ),
+            q ,
+            quality_score =quality_score ,
+            gender_prob =gender_prob ,
+            age_pred =age_pred ,
+            id_conf =id_conf ,
+            )
+        except Exception :
+            pass 
+    pn =getattr (inference ,'prototype_net',None )
+    if pn is not None :
+        try :
+            pn .update_prototype (
+            str (gid ),
+            q ,
+            quality_score ,
+            gender_prob =gender_prob ,
+            age_pred =age_pred ,
+            )
+        except Exception :
+            pass 
+    feat_store =_identity_gid_features_store (inference )
+    if bank is not None and bank .has_id (str (gid )):
+        bank_feat =bank .get_feature (str (gid ))
+        if bank_feat is not None :
+            feat_store [str (gid )]=bank_feat .detach ().cpu ().numpy ()
+            return 
+    feat_store [str (gid )]=q .detach ().cpu ().numpy ()
+
+
+def _register_gid_source (inference ,gid :str ,source_name :Optional [str ],source_kind :Optional [str ]):
+    if gid is None :
+        return 
+    if source_name :
+        _identity_gid_sources_store (inference )[str (gid )].add (str (source_name ))
+    if source_kind :
+        _identity_gid_kinds_store (inference )[str (gid )].add (str (source_kind ))
+
+
+def _register_conflict_pairs_from_gids (inference ,gid_list ):
+    gids =sorted ({str (gid )for gid in gid_list if gid })
+    if len (gids )<2 :
+        return 
+    store =_identity_conflict_pairs_store (inference )
+    for i in range (len (gids )):
+        for j in range (i +1 ,len (gids )):
+            a ,b =gids [i ],gids [j ]
+            store .add ((a ,b )if a <b else (b ,a ))
+
+
+def _merge_identity_stats (
+root_gid :str ,
+child_gid :str ,
 *,
-gids ,
-global_to_display ,
-global_gender_stats ,
-age_stats ,
-args ,
+global_to_display :dict ,
+global_gender_stats :dict ,
+global_age_stats :dict ,
+inference ,
 ):
-    grouped ={}
-    gid_list =sorted ({str (gid )for gid in (gids or [])if gid is not None },key =str )
-    for gid in gid_list :
-        disp_id =_resolve_display_id (global_to_display ,gid ,args ,fallback_to_gid =True )
-        if not disp_id :
-            continue 
-        item =grouped .setdefault (
-        disp_id ,
-        {
-        'display_id':disp_id ,
-        'gid_members':[] ,
-        'alpha_male':0.0 ,
-        'alpha_female':0.0 ,
-        'ages':[] ,
-        'has_gender_signal':False ,
-        }
-        )
-        item ['gid_members'].append (gid )
+    if root_gid ==child_gid :
+        return 
+    pn =getattr (inference ,'prototype_net',None )
+    bank =getattr (inference ,'identity_bank',None )
+    root_disp =global_to_display .get (root_gid ,root_gid )
+    global_to_display [child_gid ]=root_disp 
 
-        forced_meta =_ID_META .get (gid )or {}
-        forced_gender =forced_meta .get ('gender')
-        if forced_gender =='M':
-            item ['alpha_male']+=1.0 
-            item ['has_gender_signal']=True 
-        elif forced_gender =='F':
-            item ['alpha_female']+=1.0 
-            item ['has_gender_signal']=True 
+    root_g =global_gender_stats .get (root_gid )
+    child_g =global_gender_stats .pop (child_gid ,None )
+    if child_g is not None :
+        if root_g is None :
+            global_gender_stats [root_gid ]={
+            'alpha_male':float (child_g .get ('alpha_male',1.0 )or 1.0 ),
+            'alpha_female':float (child_g .get ('alpha_female',1.0 )or 1.0 ),
+            'stable_gender':child_g .get ('stable_gender'),
+            }
         else :
-            gstat =global_gender_stats .get (gid )if isinstance (global_gender_stats ,dict )else None 
-            if gstat is not None :
-                item ['alpha_male']+=float (gstat .get ('alpha_male',0.0 )or 0.0 )
-                item ['alpha_female']+=float (gstat .get ('alpha_female',0.0 )or 0.0 )
-                item ['has_gender_signal']=True 
+            root_g ['alpha_male']=float (root_g .get ('alpha_male',1.0 )or 1.0 )+float (child_g .get ('alpha_male',1.0 )or 1.0 )
+            root_g ['alpha_female']=float (root_g .get ('alpha_female',1.0 )or 1.0 )+float (child_g .get ('alpha_female',1.0 )or 1.0 )
+            male_mean =float (root_g ['alpha_male'])/max (1e-6 ,float (root_g ['alpha_male'])+float (root_g ['alpha_female']))
+            root_g ['stable_gender']='M'if male_mean >=0.5 else 'F'
 
-        forced_age =forced_meta .get ('age')
-        if forced_age is not None :
+    if child_gid in global_age_stats :
+        root_age =global_age_stats .setdefault (root_gid ,[])
+        root_age .extend (list (global_age_stats .pop (child_gid ,[])or []))
+
+    feat_store =_identity_gid_features_store (inference )
+    root_feat =feat_store .get (root_gid )
+    child_feat =feat_store .get (child_gid )
+    if child_feat is not None :
+        if root_feat is None :
+            feat_store [root_gid ]=child_feat 
+        else :
+            rc =0 
+            cc =0 
+            if pn is not None :
+                rc =int (getattr (pn ,'prototype_counts',{}).get (root_gid ,0 )or 0 )
+                cc =int (getattr (pn ,'prototype_counts',{}).get (child_gid ,0 )or 0 )
+            rc =max (1 ,rc )
+            cc =max (1 ,cc )
+            merged =(root_feat *rc +child_feat *cc )/float (rc +cc )
+            feat_store [root_gid ]=_normalize_np_feature (merged )
+        feat_store .pop (child_gid ,None )
+
+    src_store =_identity_gid_sources_store (inference )
+    kind_store =_identity_gid_kinds_store (inference )
+    if child_gid in src_store :
+        src_store [root_gid ].update (src_store .pop (child_gid ,set ()))
+    if child_gid in kind_store :
+        kind_store [root_gid ].update (kind_store .pop (child_gid ,set ()))
+
+    conflict_store =_identity_conflict_pairs_store (inference )
+    if conflict_store :
+        updated =set ()
+        for a ,b in conflict_store :
+            x =root_gid if a ==child_gid else a 
+            y =root_gid if b ==child_gid else b 
+            if x ==y :
+                continue 
+            updated .add ((x ,y )if x <y else (y ,x ))
+        conflict_store .clear ()
+        conflict_store .update (updated )
+
+    if pn is not None :
+        protos =getattr (pn ,'prototypes',{})
+        counts =getattr (pn ,'prototype_counts',{})
+        meta =getattr (pn ,'prototype_meta',{})
+        if root_gid in protos and child_gid in protos :
+            root_t =protos [root_gid ]
+            child_t =protos [child_gid ]
+            rc =max (1 ,int (counts .get (root_gid ,1 )or 1 ))
+            cc =max (1 ,int (counts .get (child_gid ,1 )or 1 ))
+            merged =(root_t .to (child_t .device )*rc +child_t *cc )/float (rc +cc )
+            protos [root_gid ]=F .normalize (merged ,p =2 ,dim =0 )
+            counts [root_gid ]=rc +cc 
+            del protos [child_gid ]
+            if child_gid in counts :
+                del counts [child_gid ]
+        elif child_gid in protos and root_gid not in protos :
+            protos [root_gid ]=protos .pop (child_gid )
+            counts [root_gid ]=int (counts .pop (child_gid ,1 )or 1 )
+    if child_gid in meta :
+        child_meta =meta .pop (child_gid )
+        root_meta =meta .setdefault (root_gid ,{})
+        if root_meta .get ('gender_prob')is None and child_meta .get ('gender_prob')is not None :
+            root_meta ['gender_prob']=child_meta .get ('gender_prob')
+        if root_meta .get ('age_mean')is None and child_meta .get ('age_mean')is not None :
+            root_meta ['age_mean']=child_meta .get ('age_mean')
+    if bank is not None :
+        try :
+            bank .merge (root_gid ,child_gid )
+            bank_feat =bank .get_feature (root_gid )
+            if bank_feat is not None :
+                _identity_gid_features_store (inference )[root_gid ]=bank_feat .detach ().cpu ().numpy ()
+        except Exception :
+            pass 
+
+
+def _consolidate_runtime_identities (
+*,
+inference ,
+candidate_gids ,
+global_to_display :dict ,
+global_gender_stats :dict ,
+global_age_stats :dict ,
+args ,
+gid_feature_map :Optional [dict ]=None ,
+id_root :Optional [str ]=None ,
+log_prefix :str ="post-merge",
+):
+    if not bool (getattr (args ,'post_merge_enable',True )):
+        return {}
+    gid_list =sorted ({str (gid )for gid in candidate_gids if gid is not None },key =str )
+    if len (gid_list )<2 :
+        return {}
+
+    pn =getattr (inference ,'prototype_net',None )
+    stored_features =_identity_gid_features_store (inference )
+    for gid ,feat in (gid_feature_map or {}).items ():
+        nf =_normalize_np_feature (feat )
+        if nf is not None :
+            stored_features [str (gid )]=nf 
+
+    def _make_info (gid :str ):
+        feat =None 
+        if gid_feature_map is not None and gid in gid_feature_map :
+            feat =gid_feature_map .get (gid )
+        if feat is None and gid in stored_features :
+            feat =stored_features .get (gid )
+        if feat is None and pn is not None and gid in getattr (pn ,'prototypes',{}):
             try :
-                item ['ages'].append (float (forced_age ))
+                feat =getattr (pn ,'prototypes',{})[gid ].detach ().cpu ().numpy ()
+            except Exception :
+                feat =None 
+        feat =_normalize_np_feature (feat )
+
+        gstat =global_gender_stats .get (gid ,{})
+        a_male =float (gstat .get ('alpha_male',1.0 )or 1.0 )
+        a_female =float (gstat .get ('alpha_female',1.0 )or 1.0 )
+        total =a_male +a_female 
+        male_mean =a_male /max (1e-6 ,total )
+        gender ='M'if male_mean >=float (getattr (args ,'gender_threshold',0.5 )or 0.5 )else 'F'
+        gender_conf =_gender_confidence_01 (male_mean ,stable_gender =gender ,threshold =getattr (args ,'gender_threshold',0.5 ))
+
+        ages =[]
+        for age in global_age_stats .get (gid ,[])or []:
+            try :
+                ages .append (float (age ))
             except Exception :
                 pass 
-        for age in (age_stats .get (gid ,[])if isinstance (age_stats ,dict )else []):
-            try :
-                item ['ages'].append (float (age ))
-            except Exception :
-                pass 
+        age_mean =float (np .median (ages ))if len (ages )>0 else None 
 
-    summary ={}
-    for disp_id in sorted (grouped .keys (),key =_sort_display_id_key ):
-        item =grouped [disp_id ]
-        total =float (item ['alpha_male'])+float (item ['alpha_female'])
-        if item ['has_gender_signal']and total >0.0 :
-            male_mean =float (item ['alpha_male']/max (1e-6 ,total ))
-            gender ='M'if male_mean >=float (args .gender_threshold )else 'F'
-            gender_conf =_gender_confidence_01 (male_mean ,stable_gender =gender ,threshold =args .gender_threshold )
-        else :
-            male_mean =0.5 
-            gender ='-'
-            gender_conf =0.0 
-        summary [disp_id ]={
-        'gid':','.join (item ['gid_members']),
-        'gid_members':list (item ['gid_members']),
-        'display_id':disp_id ,
+        count =len (ages )
+        if pn is not None :
+            count =max (count ,int (getattr (pn ,'prototype_counts',{}).get (gid ,0 )or 0 ))
+        count =max (1 ,count )
+        kinds =set (_identity_gid_kinds_store (inference ).get (gid ,set ()))
+        if not kinds :
+            kinds ={'image'}
+        sources =set (_identity_gid_sources_store (inference ).get (gid ,set ()))
+        return {
+        'gid':gid ,
+        'display_id':global_to_display .get (gid ,gid ),
+        'feature':feat ,
+        'count':count ,
+        'alpha_male':a_male ,
+        'alpha_female':a_female ,
         'gender':gender ,
-        'male_mean':male_mean ,
         'gender_conf':gender_conf ,
-        'age_mean':_aggregate_age_value (item ['ages'],args ),
+        'age_mean':age_mean ,
+        'ages':ages ,
+        'kinds':kinds ,
+        'sources':sources ,
+        'members':{gid },
         }
-    return summary 
+
+    active ={gid :_make_info (gid )for gid in gid_list }
+    conflicts =_identity_conflict_pairs_store (inference )
+    near_miss_log =[]
+
+    def _has_conflict (info_a ,info_b ):
+        for ga in info_a ['members']:
+            for gb in info_b ['members']:
+                if ga ==gb :
+                    continue 
+                pair =(ga ,gb )if ga <gb else (gb ,ga )
+                if pair in conflicts :
+                    return True 
+        return False 
+
+    merge_log =[]
+    while True :
+        keys =sorted (active .keys (),key =lambda gid :_display_id_sort_key (active [gid ]['display_id']))
+        best =None 
+        for i in range (len (keys )):
+            for j in range (i +1 ,len (keys )):
+                gid_a =keys [i ]
+                gid_b =keys [j ]
+                info_a =active [gid_a ]
+                info_b =active [gid_b ]
+                if info_a ['feature']is None or info_b ['feature']is None :
+                    continue 
+
+                sim =_fused_similarity_np (
+                info_a ['feature'],
+                info_b ['feature'],
+                w_cos =getattr (args ,'sim_cosine_w',0.7 ),
+                w_euc =getattr (args ,'sim_euclid_w',0.3 ),
+                )
+                if sim <=0.0 :
+                    continue 
+
+                blocked_by_conflict =_has_conflict (info_a ,info_b )
+
+                kinds =set (info_a ['kinds'])|set (info_b ['kinds'])
+                if kinds =={'video'}:
+                    th =float (getattr (args ,'post_merge_video_min_sim',0.41 )or 0.41 )
+                elif kinds =={'image'}:
+                    th =float (getattr (args ,'post_merge_image_min_sim',0.56 )or 0.56 )
+                else :
+                    th =float (getattr (args ,'post_merge_mixed_min_sim',0.52 )or 0.52 )
+
+                small =min (int (info_a ['count']),int (info_b ['count']))
+                big =max (int (info_a ['count']),int (info_b ['count']))
+                relax =float (getattr (args ,'post_merge_fragment_relax',0.04 )or 0.04 )
+                if big >=3 and small <=max (3 ,int (0.35 *big )):
+                    th -=relax 
+                if kinds =={'image'}:
+                    tiny_max =int (getattr (args ,'post_merge_tiny_image_max_size',3 )or 3 )
+                    tiny_min_sim =float (getattr (args ,'post_merge_tiny_image_min_sim',0.44 )or 0.44 )
+                    if small <=tiny_max and big >=max (8 ,tiny_max *3 ):
+                        th =min (th ,tiny_min_sim )
+
+                if info_a ['gender']!=info_b ['gender']:
+                    guard =float (getattr (args ,'post_merge_gender_conf_guard',0.80 )or 0.80 )
+                    if info_a ['gender_conf']>=guard and info_b ['gender_conf']>=guard :
+                        continue 
+                    th +=0.03 
+
+                age_a =info_a ['age_mean']
+                age_b =info_b ['age_mean']
+                if age_a is not None and age_b is not None :
+                    age_gap =abs (float (age_a )-float (age_b ))
+                    hard_gap =float (getattr (args ,'post_merge_age_gap_hard',6.0 )or 6.0 )
+                    soft_gap =float (getattr (args ,'post_merge_age_gap_soft',3.0 )or 3.0 )
+                    if age_gap >hard_gap :
+                        continue 
+                    if age_gap >soft_gap :
+                        th +=0.03 
+
+                near_miss_log .append ({
+                'gid_a':gid_a ,
+                'gid_b':gid_b ,
+                'disp_a':info_a ['display_id'],
+                'disp_b':info_b ['display_id'],
+                'sim':float (sim ),
+                'th':float (th ),
+                'blocked_by_conflict':bool (blocked_by_conflict ),
+                'count_a':int (info_a ['count']),
+                'count_b':int (info_b ['count']),
+                })
+                if blocked_by_conflict :
+                    continue 
+                if sim >=th :
+                    cand =(sim ,-th ,gid_a ,gid_b )
+                    if best is None or cand >best :
+                        best =cand 
+
+        if best is None :
+            break 
+
+        sim ,neg_th ,gid_a ,gid_b =best 
+        info_a =active [gid_a ]
+        info_b =active [gid_b ]
+        root_gid =gid_a if _display_id_sort_key (info_a ['display_id'])<=_display_id_sort_key (info_b ['display_id'])else gid_b 
+        child_gid =gid_b if root_gid ==gid_a else gid_a 
+        root =active [root_gid ]
+        child =active [child_gid ]
+
+        root_count =max (1 ,int (root ['count']))
+        child_count =max (1 ,int (child ['count']))
+        merged_feat =None 
+        if root ['feature']is not None and child ['feature']is not None :
+            merged_feat =(root ['feature']*root_count +child ['feature']*child_count )/float (root_count +child_count )
+            merged_feat =_normalize_np_feature (merged_feat )
+
+        root ['feature']=merged_feat if merged_feat is not None else (root ['feature']or child ['feature'])
+        root ['count']=root_count +child_count 
+        root ['alpha_male']=float (root ['alpha_male'])+float (child ['alpha_male'])
+        root ['alpha_female']=float (root ['alpha_female'])+float (child ['alpha_female'])
+        total =root ['alpha_male']+root ['alpha_female']
+        male_mean =root ['alpha_male']/max (1e-6 ,total )
+        root ['gender']='M'if male_mean >=float (getattr (args ,'gender_threshold',0.5 )or 0.5 )else 'F'
+        root ['gender_conf']=_gender_confidence_01 (male_mean ,stable_gender =root ['gender'],threshold =getattr (args ,'gender_threshold',0.5 ))
+        root ['ages'].extend (child ['ages'])
+        root ['age_mean']=float (np .median (root ['ages']))if len (root ['ages'])>0 else None 
+        root ['kinds'].update (child ['kinds'])
+        root ['sources'].update (child ['sources'])
+        root ['members'].update (child ['members'])
+        active .pop (child_gid ,None )
+
+        merge_log .append ({
+        'root_gid':root_gid ,
+        'child_gid':child_gid ,
+        'root_display_id':global_to_display .get (root_gid ,root_gid ),
+        'child_display_id':global_to_display .get (child_gid ,child_gid ),
+        'similarity':float (sim ),
+        'threshold':float (-neg_th ),
+        })
+
+    if not merge_log :
+        if near_miss_log and bool (getattr (args ,'verbose',False )):
+            print (f"[INFO] {log_prefix}: no merge accepted, top candidate pairs:")
+            for item in sorted (near_miss_log ,key =lambda x :x ['sim'],reverse =True )[:5 ]:
+                print (
+                f"  {item['disp_a']}({item['count_a']}) vs {item['disp_b']}({item['count_b']}): "
+                f"sim={item['sim']:.3f}, th={item['th']:.3f}, conflict={item['blocked_by_conflict']}"
+                )
+        return {}
+
+    alias_map ={}
+    for item in merge_log :
+        root_gid =item ['root_gid']
+        child_gid =item ['child_gid']
+        _merge_identity_stats (
+        root_gid ,
+        child_gid ,
+        global_to_display =global_to_display ,
+        global_gender_stats =global_gender_stats ,
+        global_age_stats =global_age_stats ,
+        inference =inference ,
+        )
+        alias_map [child_gid ]=root_gid 
+        _merge_grouped_output_folders (
+        id_root ,
+        item ['child_display_id'],
+        item ['root_display_id'],
+        )
+
+    print (f"[INFO] {log_prefix}: merged {len(merge_log)} identity pairs")
+    for item in merge_log :
+        print (
+        f"  {item['child_display_id']}({item['child_gid']}) -> "
+        f"{item['root_display_id']}({item['root_gid']}), "
+        f"sim={item['similarity']:.3f}, th={item['threshold']:.3f}"
+        )
+    return alias_map 
 
 
-def _compress_detection_id_records (id_records ,args ):
-    grouped ={}
-    for disp_id ,gender ,age in id_records or []:
-        key =str (disp_id )
-        item =grouped .setdefault (key ,{'genders':[],'ages':[]})
-        g =str (gender ).strip ()if gender is not None else ''
-        if g in {'M','F'}:
-            item ['genders'].append (g )
-        if age is not None :
-            try :
-                item ['ages'].append (float (age ))
-            except Exception :
-                pass 
+def _remap_gid_to_root (gid :Optional [str ],alias_map :dict )->Optional [str ]:
+    if gid is None :
+        return None 
+    cur =str (gid )
+    visited =set ()
+    while cur in alias_map and cur not in visited :
+        visited .add (cur )
+        cur =str (alias_map [cur ])
+    return cur 
 
-    out =[]
-    for disp_id in sorted (grouped .keys (),key =_sort_display_id_key ):
-        item =grouped [disp_id ]
-        if item ['genders']:
-            m =sum (1 for g in item ['genders']if g =='M')
-            f =sum (1 for g in item ['genders']if g =='F')
-            gender ='M'if m >f else 'F'if f >m else item ['genders'][-1 ]
-        else :
-            gender ='-'
-        age_value =_aggregate_age_value (item ['ages'],args )
-        out .append ((disp_id ,gender ,age_value ))
-    return out 
+
+def _remap_detection_records (detection_records ,global_to_display :dict ,alias_map :dict ):
+    if not detection_records :
+        return detection_records 
+    remapped =[]
+    for rel_path ,id_records in detection_records :
+        grouped ={}
+        for disp_id ,gender ,age in id_records :
+            gid =None 
+            for k ,v in global_to_display .items ():
+                if str (v )==str (disp_id ):
+                    gid =k 
+                    break 
+            if gid is not None :
+                gid =_remap_gid_to_root (gid ,alias_map )
+                new_disp =global_to_display .get (gid ,disp_id )
+            else :
+                new_disp =disp_id 
+            item =grouped .setdefault (str (new_disp ),{'genders':[],'ages':[]})
+            g =str (gender ).strip ()if gender is not None else ''
+            if g in {'M','F'}:
+                item ['genders'].append (g )
+            if age is not None :
+                try :
+                    item ['ages'].append (float (age ))
+                except Exception :
+                    pass 
+        merged_records =[]
+        for key in sorted (grouped .keys (),key =_display_id_sort_key ):
+            item =grouped [key ]
+            if item ['genders']:
+                m =sum (1 for x in item ['genders']if x =='M')
+                f =sum (1 for x in item ['genders']if x =='F')
+                gender ='M'if m >f else 'F'if f >m else item ['genders'][-1 ]
+            else :
+                gender ='-'
+            age_val =float (np .median (item ['ages']))if item ['ages']else None 
+            merged_records .append ((key ,gender ,age_val ))
+        remapped .append ((rel_path ,merged_records ))
+    return remapped 
 
 
 
@@ -585,6 +1086,7 @@ def parse_args ():
     # Input/Output
     p .add_argument ('--input',type =str ,default =None )
     p .add_argument ('--output',type =str ,default =None ,help ='output directory')
+    p .add_argument ('--file-list',type =str ,default =None ,help ='UTF-8 text file with absolute or input-root relative media paths to process')
 
     # Detector/tracker
     p .add_argument ('--yolo-repo-root',type =str ,default =None ,help ='preferred local ultralytics repo root for YOLO26')
@@ -600,6 +1102,7 @@ def parse_args ():
 
     # Tracking behavior
     p .add_argument ('--sec-interval',type =float ,default =None ,help ='status update interval (seconds)')
+    p .add_argument ('--vid-stride',type =int ,default =None ,help ='process every Nth video frame; 1 keeps full-frame tracking')
     p .add_argument ('--max-keep-missing-sec',type =float ,default =None ,help ='keep lost track state for N seconds')
 
     # Quality filtering
@@ -619,8 +1122,14 @@ def parse_args ():
     p .add_argument ('--update-existing-min-id-conf',type =float ,default =None ,help ='minimum id confidence to update existing prototype')
     p .add_argument ('--shuffle-images',type =int ,default =None ,choices =[0 ,1 ],help ='shuffle image-file inference order to reduce order bias')
     p .add_argument ('--shuffle-seed',type =int ,default =None ,help ='seed for image order shuffling')
+    p .add_argument ('--prototype-strategy',type =str ,default =None ,choices =['single','multi','spherical_multi'],help ='online identity memory strategy')
+    p .add_argument ('--prototype-max-slots',type =int ,default =None ,help ='max sub-prototypes per identity')
+    p .add_argument ('--prototype-spawn-similarity',type =float ,default =None ,help ='spawn new sub-prototype below this similarity')
+    p .add_argument ('--prototype-update-similarity',type =float ,default =None ,help ='low-similarity update soft gate')
+    p .add_argument ('--prototype-topk',type =int ,default =None ,help ='top-k slots used in multi-prototype scoring')
+    p .add_argument ('--prototype-aggregate-weight',type =float ,default =None ,help ='weight of best slot vs top-k mean')
     p .add_argument ('--image-cluster-mode',type =str ,default =None ,choices =['online','twopass'],help ='image-directory ID assignment mode')
-    p .add_argument ('--cluster-method',type =str ,default =None ,choices =['auto','agglomerative','sequential'],help ='global clustering method for twopass mode')
+    p .add_argument ('--cluster-method',type =str ,default =None ,choices =['auto','agglomerative','sequential','multi_proto','spherical_multi'],help ='global clustering method for twopass mode')
     p .add_argument ('--twopass-threshold',type =float ,default =None ,help ='similarity threshold used in twopass image clustering')
     p .add_argument ('--twopass-threshold-auto',type =int ,default =None ,choices =[0 ,1 ],help ='auto-select twopass clustering threshold from feature statistics')
     p .add_argument ('--cluster-agglomerative-max-n',type =int ,default =None ,help ='max ROI count for agglomerative clustering')
@@ -628,6 +1137,9 @@ def parse_args ():
     p .add_argument ('--max-rois-per-image',type =int ,default =None ,help ='max kept ROIs per image in twopass mode')
     p .add_argument ('--twopass-fuse-full-image',type =int ,default =None ,choices =[0 ,1 ],help ='fuse full-image feature with ROI feature in twopass image mode')
     p .add_argument ('--twopass-full-image-weight',type =float ,default =None ,help ='fusion weight of full-image feature [0,1]')
+    p .add_argument ('--twopass-cluster-aux-reid-weight',type =float ,default =None ,help ='concat aux ReID embedding into twopass clustering feature [0,1]')
+    p .add_argument ('--twopass-cluster-aux-gender-weight',type =float ,default =None ,help ='concat gender cue into twopass clustering feature [0,1]')
+    p .add_argument ('--twopass-cluster-aux-age-weight',type =float ,default =None ,help ='concat age cue into twopass clustering feature [0,1]')
     p .add_argument ('--twopass-auto-merge',type =int ,default =None ,choices =[0 ,1 ],help ='auto-merge close clusters after twopass clustering')
     p .add_argument ('--twopass-target-cluster-size',type =float ,default =None ,help ='target samples per identity for auto merge')
     p .add_argument ('--twopass-merge-min-sim',type =float ,default =None ,help ='minimum centroid similarity to allow cluster merge')
@@ -635,6 +1147,18 @@ def parse_args ():
     p .add_argument ('--twopass-refine-min-size',type =int ,default =None ,help ='minimum cluster size to trigger split refinement')
     p .add_argument ('--twopass-refine-delta',type =float ,default =None ,help ='threshold delta used in split refinement')
     p .add_argument ('--twopass-refine-min-subcluster',type =int ,default =None ,help ='minimum subcluster size to accept split refinement')
+    p .add_argument ('--post-merge-enable',type =int ,default =None ,choices =[0 ,1 ],help ='enable conservative post-merge of fragmented IDs')
+    p .add_argument ('--post-merge-enable-video',type =int ,default =None ,choices =[0 ,1 ],help ='enable post-merge for video / cross-video identities')
+    p .add_argument ('--post-merge-enable-image',type =int ,default =None ,choices =[0 ,1 ],help ='enable post-merge for image-directory identities')
+    p .add_argument ('--post-merge-video-min-sim',type =float ,default =None ,help ='minimum similarity for video-level identity post-merge')
+    p .add_argument ('--post-merge-image-min-sim',type =float ,default =None ,help ='minimum similarity for image-level identity post-merge')
+    p .add_argument ('--post-merge-mixed-min-sim',type =float ,default =None ,help ='minimum similarity for mixed-source identity post-merge')
+    p .add_argument ('--post-merge-gender-conf-guard',type =float ,default =None ,help ='block opposite-gender post-merge above this confidence')
+    p .add_argument ('--post-merge-age-gap-soft',type =float ,default =None ,help ='soft age-gap penalty for post-merge')
+    p .add_argument ('--post-merge-age-gap-hard',type =float ,default =None ,help ='hard age-gap cutoff for post-merge')
+    p .add_argument ('--post-merge-fragment-relax',type =float ,default =None ,help ='similarity relaxation for tiny fragments in post-merge')
+    p .add_argument ('--post-merge-tiny-image-max-size',type =int ,default =None ,help ='max image-only cluster size treated as tiny fragment')
+    p .add_argument ('--post-merge-tiny-image-min-sim',type =float ,default =None ,help ='minimum similarity for tiny image-fragment merge')
 
     # ROI-only mode: do not run detector, treat each input image as one ROI
     p .add_argument ('--image-as-roi',type =int ,default =None ,choices =[0 ,1 ],help ='1: each image is ROI; 0: run detector first')
@@ -1378,9 +1902,10 @@ def _attach_aux_predictor (inference ,args ):
     return aux_predictor is not None 
 
 
-def _forward_reid_and_aux (inference ,reid_input ,crops_rgb =None ):
+def _forward_reid_and_aux (inference ,reid_input ,crops_rgb =None ,return_aux_feat :bool =False ,fuse_aux_into_main :bool =True ):
     feat_after_bn ,_feat_before_bn ,gender_logits ,age_pred =inference .model .forward_multitask (reid_input )
     feat_after_bn =F .normalize (feat_after_bn ,p =2 ,dim =1 )
+    aux_feat_out =None
 
     aux_predictor =getattr (inference ,"aux_predictor",None )
     aux_transform =getattr (inference ,"aux_transform",None )
@@ -1402,11 +1927,12 @@ def _forward_reid_and_aux (inference ,reid_input ,crops_rgb =None ):
             args =getattr (inference ,'args',None )
             aux_fuse_w =0.0 if args is None else float (getattr (args ,'aux_feature_fuse_weight',0.0 )or 0.0 )
             aux_fuse_w =float (min (1.0 ,max (0.0 ,aux_fuse_w )))
-            if aux_fuse_w >0.0 and str (getattr (aux_predictor ,'kind',''))=='reid_aux':
+            if str (getattr (aux_predictor ,'kind',''))=='reid_aux':
                 aux_feat ,gender_logits ,age_pred =aux_predictor (x_aux ,return_feat =True )
                 if aux_feat is not None :
                     aux_feat =F .normalize (aux_feat ,p =2 ,dim =1 )
-                    if tuple (aux_feat .shape )==tuple (feat_after_bn .shape ):
+                    aux_feat_out =aux_feat 
+                    if aux_fuse_w >0.0 and fuse_aux_into_main and tuple (aux_feat .shape )==tuple (feat_after_bn .shape ):
                         feat_after_bn =F .normalize (
                         (1.0 -aux_fuse_w )*feat_after_bn +aux_fuse_w *aux_feat ,
                         p =2 ,
@@ -1418,6 +1944,8 @@ def _forward_reid_and_aux (inference ,reid_input ,crops_rgb =None ):
     if getattr (age_pred ,"ndim",1 )>1 :
         age_pred =age_pred .view (age_pred .shape [0 ],-1 )[:,0 ]
     male_probs =F .softmax (gender_logits ,dim =1 )[:,1 ]
+    if return_aux_feat :
+        return feat_after_bn ,male_probs ,age_pred ,aux_feat_out 
     return feat_after_bn ,male_probs ,age_pred 
 
 
@@ -1573,7 +2101,14 @@ reserved_ids ,args ,verbose =False ,tid =None ,event ='',known_ids =None ):
         # ID
         candidates =[cid for cid in candidates_all if cid not in reserved_ids ]or list (candidates_all )
 
-        res =inference .prototype_net (aggregated_feat ,known_ids =candidates_all ,aux =aux )
+        res =_match_identity_with_strategy (
+        inference ,
+        aggregated_feat ,
+        aux =aux ,
+        reserved_ids =reserved_ids ,
+        candidate_ids =candidates_all ,
+        allow_new =False ,
+        )
         sims =res .get ('all_similarities',{})or {}
         gid =None 
         best_score =None 
@@ -1588,7 +2123,14 @@ reserved_ids ,args ,verbose =False ,tid =None ,event ='',known_ids =None ):
         adaptive_th =float (res .get ('adaptive_threshold',0.0 )or 0.0 )
         _created_new =False 
     else :
-        res =inference .prototype_net (aggregated_feat ,aux =aux )
+        res =_match_identity_with_strategy (
+        inference ,
+        aggregated_feat ,
+        aux =aux ,
+        reserved_ids =reserved_ids ,
+        candidate_ids =None ,
+        allow_new =True ,
+        )
         gid ,sim_for_log ,_created_new ,adaptive_th =_pick_global_id_from_prototype_result (
         res ,inference ,reserved_ids ,allow_new =True 
         )
@@ -1612,8 +2154,14 @@ reserved_ids ,args ,verbose =False ,tid =None ,event ='',known_ids =None ):
     min_upd_conf =float (getattr (args ,'update_existing_min_id_conf',0.55 )or 0.55 )
     should_update =(bool (_created_new )or (id_conf_01 >=min_upd_conf ))
     if should_update :
-        inference .prototype_net .update_prototype (
-        gid ,aggregated_feat ,quality_score ,gender_prob =agg_male_p ,age_pred =agg_age_p 
+        _update_identity_memory (
+        inference ,
+        gid ,
+        aggregated_feat ,
+        quality_score ,
+        gender_prob =agg_male_p ,
+        age_pred =agg_age_p ,
+        id_conf =id_conf_01 ,
         )
 
     
@@ -1669,7 +2217,7 @@ reserved_ids ,args ,verbose =False ,tid =None ,event ='',known_ids =None ):
     return gid ,sim_for_log ,next_display_id_inc 
 
 
-def _reorganize_folders_by_id (id_root ,finalized_track_map ,global_to_display =None ,args =None ):# noqa: ARG001
+def _reorganize_folders_by_id (id_root ,finalized_track_map ,global_to_display =None ):# noqa: ARG001
     """trk{id}  ID{n} 
 
     IDD
@@ -1688,7 +2236,7 @@ def _reorganize_folders_by_id (id_root ,finalized_track_map ,global_to_display =
         trk_name =f"trk{tid}"
         display_id =info .get ('display_id')
         if display_id :
-            trk_to_display [trk_name ]=_customize_disp_id (display_id ,args )if args is not None else display_id 
+            trk_to_display [trk_name ]=display_id 
 
             
     existing_folders =[d for d in os .listdir (id_root )if os .path .isdir (os .path .join (id_root ,d ))]
@@ -1761,13 +2309,9 @@ fallback_folder :str ="UNASSIGNED",
         save_name =_flatten_rel_path (rel_name )or os .path .basename (getattr (args ,'input',"output.jpg"))
         targets =[]
         if disp_ids is not None :
-            targets =[
-            _customize_disp_id (str (x ),args )
-            for x in disp_ids
-            if x is not None and str (x )!=""
-            ]
+            targets =[str (x )for x in disp_ids if x is not None and str (x )!=""]
         if not targets :
-            targets =[_customize_disp_id (str (fallback_folder ),args )]
+            targets =[str (fallback_folder )]
         ok_any =False 
         for disp_id in sorted (set (targets )):
             id_dir =os .path .join (id_root ,disp_id )
@@ -1889,6 +2433,12 @@ threshold :float ,
 method :str ='auto',
 agglomerative_max_n :int =5000 ,
 momentum :float =0.9 ,
+sim_cosine_w :float =0.7 ,
+sim_euclid_w :float =0.3 ,
+mp_max_slots :int =4 ,
+mp_spawn_similarity :float =0.68 ,
+mp_topk :int =2 ,
+mp_aggregate_weight :float =0.75 ,
 seed :int =42 ,
 ):
     """
@@ -1904,6 +2454,7 @@ seed :int =42 ,
     threshold =float (threshold )
     agglomerative_max_n =max (1 ,int (agglomerative_max_n ))
     use_agglomerative =(method in {'auto','agglomerative'})and (n <=agglomerative_max_n )
+    use_multi_proto =method in {'multi_proto','spherical_multi'}
 
     if use_agglomerative :
         try :
@@ -1922,6 +2473,22 @@ seed :int =42 ,
         except Exception as e :
             if method =='agglomerative':
                 raise RuntimeError (f"Agglomerative clustering failed: {e}")from e 
+
+    if use_multi_proto :
+        labels =cluster_embeddings_multiproto (
+        features ,
+        threshold =threshold ,
+        momentum =float (momentum ),
+        max_slots =int (mp_max_slots ),
+        spawn_similarity =float (mp_spawn_similarity ),
+        topk =int (mp_topk ),
+        aggregate_weight =float (mp_aggregate_weight ),
+        sim_cosine_w =float (sim_cosine_w ),
+        sim_euclid_w =float (sim_euclid_w ),
+        spherical =bool (method =='spherical_multi'),
+        seed =int (seed ),
+        )
+        return labels .astype (np .int32 ,copy =False ),str (method )
 
     # Sequential fallback with shuffle to reduce order bias.
     order =np .arange (n ,dtype =np .int32 )
@@ -1973,6 +2540,12 @@ features :np .ndarray ,
 method :str ='auto',
 agglomerative_max_n :int =5000 ,
 momentum :float =0.9 ,
+sim_cosine_w :float =0.7 ,
+sim_euclid_w :float =0.3 ,
+mp_max_slots :int =4 ,
+mp_spawn_similarity :float =0.68 ,
+mp_topk :int =2 ,
+mp_aggregate_weight :float =0.75 ,
 target_cluster_size :float =26.0 ,
 seed :int =42 ,
 verbose :bool =False ,
@@ -2004,6 +2577,12 @@ verbose :bool =False ,
         method =method ,
         agglomerative_max_n =agglomerative_max_n ,
         momentum =momentum ,
+        sim_cosine_w =sim_cosine_w ,
+        sim_euclid_w =sim_euclid_w ,
+        mp_max_slots =mp_max_slots ,
+        mp_spawn_similarity =mp_spawn_similarity ,
+        mp_topk =mp_topk ,
+        mp_aggregate_weight =mp_aggregate_weight ,
         seed =seed ,
         )
         uniq ,counts =np .unique (labels ,return_counts =True )
@@ -2071,6 +2650,12 @@ verbose :bool =False ,
         method =method ,
         agglomerative_max_n =agglomerative_max_n ,
         momentum =momentum ,
+        sim_cosine_w =sim_cosine_w ,
+        sim_euclid_w =sim_euclid_w ,
+        mp_max_slots =mp_max_slots ,
+        mp_spawn_similarity =mp_spawn_similarity ,
+        mp_topk =mp_topk ,
+        mp_aggregate_weight =mp_aggregate_weight ,
         seed =seed ,
         )
         return 0.17 ,labels ,str (m_used ),stats 
@@ -2098,6 +2683,12 @@ base_threshold :float ,
 method :str ='auto',
 agglomerative_max_n :int =5000 ,
 momentum :float =0.9 ,
+sim_cosine_w :float =0.7 ,
+sim_euclid_w :float =0.3 ,
+mp_max_slots :int =4 ,
+mp_spawn_similarity :float =0.68 ,
+mp_topk :int =2 ,
+mp_aggregate_weight :float =0.75 ,
 seed :int =42 ,
 min_cluster_size :int =18 ,
 min_subcluster_size :int =4 ,
@@ -2151,6 +2742,12 @@ verbose :bool =False ,
             method =sub_method ,
             agglomerative_max_n =int (max (200 ,min (agglomerative_max_n ,m *4 ))),
             momentum =momentum ,
+            sim_cosine_w =sim_cosine_w ,
+            sim_euclid_w =sim_euclid_w ,
+            mp_max_slots =mp_max_slots ,
+            mp_spawn_similarity =mp_spawn_similarity ,
+            mp_topk =mp_topk ,
+            mp_aggregate_weight =mp_aggregate_weight ,
             seed =seed ,
             )
         except Exception :
@@ -2290,6 +2887,200 @@ min_sim :float =0.45 ,
         'k_after':int (np .unique (labels ).size ),
         })
     return labels ,merge_log 
+
+
+def _merge_labels_by_centroid_topology (
+labels :np .ndarray ,
+features :np .ndarray ,
+male_probs :Optional [np .ndarray ]=None ,
+*,
+method :str ='agglomerative',
+auto_threshold :bool =True ,
+threshold :float =0.18 ,
+fragment_group_size :float =16.0 ,
+min_fragments :int =128 ,
+agglomerative_max_n :int =5000 ,
+momentum :float =0.9 ,
+sim_cosine_w :float =0.7 ,
+sim_euclid_w :float =0.3 ,
+mp_max_slots :int =4 ,
+mp_spawn_similarity :float =0.68 ,
+mp_topk :int =2 ,
+mp_aggregate_weight :float =0.75 ,
+auto_merge :bool =False ,
+merge_min_sim :float =0.40 ,
+seed :int =42 ,
+verbose :bool =False ,
+):
+    """
+    Stage-2 merge on stage-1 fragment centroids.
+    This targets the common failure mode on large ROI-image sets:
+    strong features + very pure micro-clusters + severe over-splitting.
+    """
+    if labels is None or features is None :
+        return labels ,{'applied':False ,'reason':'empty'}
+    labels =np .asarray (labels ,dtype =np .int32 )
+    features =np .asarray (features ,dtype =np .float32 )
+    if labels .size <=1 or features .shape [0 ]!=labels .size :
+        return labels ,{'applied':False ,'reason':'invalid-shape'}
+
+    uniq =np .unique (labels )
+    k_frag =int (uniq .size )
+    if k_frag <int (max (2 ,min_fragments )):
+        return labels ,{'applied':False ,'reason':'few-fragments','stage1_fragments':k_frag}
+
+    centroids =[]
+    frag_male =[]
+    for lb in uniq :
+        idxs =np .where (labels ==lb )[0 ]
+        cen =np .mean (features [idxs ],axis =0 )
+        cen =cen /(float (np .linalg .norm (cen ))+1e-12 )
+        centroids .append (cen .astype (np .float32 ,copy =False ))
+        if male_probs is not None and male_probs .size ==labels .size :
+            frag_male .append (float (np .mean (male_probs [idxs ])))
+        else :
+            frag_male .append (0.5 )
+    centroids =np .stack (centroids ,axis =0 ).astype (np .float32 ,copy =False )
+    frag_male =np .asarray (frag_male ,dtype =np .float32 )
+
+    if bool (auto_threshold ):
+        th2 ,frag_labels ,used_method ,_ =_auto_select_twopass_threshold (
+        centroids ,
+        method =str (method or 'agglomerative'),
+        agglomerative_max_n =int (agglomerative_max_n ),
+        momentum =float (momentum ),
+        sim_cosine_w =float (sim_cosine_w ),
+        sim_euclid_w =float (sim_euclid_w ),
+        mp_max_slots =int (mp_max_slots ),
+        mp_spawn_similarity =float (mp_spawn_similarity ),
+        mp_topk =int (mp_topk ),
+        mp_aggregate_weight =float (mp_aggregate_weight ),
+        target_cluster_size =float (max (1.0 ,fragment_group_size )),
+        seed =int (seed ),
+        verbose =False ,
+        )
+    else :
+        th2 =float (threshold )
+        frag_labels ,used_method =_cluster_embeddings_global (
+        centroids ,
+        threshold =float (th2 ),
+        method =str (method or 'agglomerative'),
+        agglomerative_max_n =int (agglomerative_max_n ),
+        momentum =float (momentum ),
+        sim_cosine_w =float (sim_cosine_w ),
+        sim_euclid_w =float (sim_euclid_w ),
+        mp_max_slots =int (mp_max_slots ),
+        mp_spawn_similarity =float (mp_spawn_similarity ),
+        mp_topk =int (mp_topk ),
+        mp_aggregate_weight =float (mp_aggregate_weight ),
+        seed =int (seed ),
+        )
+
+    if bool (auto_merge ):
+        k_before =int (np .unique (frag_labels ).size )
+        target_k =int (round (float (k_frag )/max (1.0 ,float (fragment_group_size ))))
+        target_k =int (max (2 ,min (k_before ,target_k )))
+        if target_k <k_before :
+            frag_labels ,_ =_merge_labels_toward_target (
+            frag_labels ,
+            centroids ,
+            male_probs =frag_male ,
+            target_k =target_k ,
+            min_sim =float (merge_min_sim ),
+            )
+
+    lb_map ={int (lb ):int (frag_labels [i ])for i ,lb in enumerate (uniq .tolist ())}
+    merged =np .zeros_like (labels ,dtype =np .int32 )
+    for old_lb ,new_lb in lb_map .items ():
+        merged [labels ==old_lb ]=int (new_lb )
+    uniq2 =np .unique (merged )
+    remap ={int (u ):i for i ,u in enumerate (uniq2 .tolist ())}
+    out =np .zeros_like (merged ,dtype =np .int32 )
+    for old_lb ,new_lb in remap .items ():
+        out [merged ==old_lb ]=int (new_lb )
+
+    info ={
+    'applied':True ,
+    'stage1_fragments':int (k_frag ),
+    'stage2_clusters':int (np .unique (out ).size ),
+    'threshold':float (th2 ),
+    'method':str (used_method ),
+    }
+    if verbose :
+        print (
+        f"[INFO] Centroid-topology merge: k {int(k_frag)}->{int(info['stage2_clusters'])}, "
+        f"method={str(used_method)}, threshold={float(th2):.3f}"
+        )
+    return out ,info 
+
+
+def _build_aux_aware_cluster_features (features :np .ndarray ,samples ,args ):
+    """Lightly inject age/gender cues into clustering without replacing ReID features."""
+    if features is None or len (features )==0 :
+        return features 
+    try :
+        reid_w =float (getattr (args ,'twopass_cluster_aux_reid_weight',0.0 )or 0.0 )
+    except Exception :
+        reid_w =0.0 
+    try :
+        gender_w =float (getattr (args ,'twopass_cluster_aux_gender_weight',0.0 )or 0.0 )
+    except Exception :
+        gender_w =0.0 
+    try :
+        age_w =float (getattr (args ,'twopass_cluster_aux_age_weight',0.0 )or 0.0 )
+    except Exception :
+        age_w =0.0 
+    if reid_w <=0.0 and gender_w <=0.0 and age_w <=0.0 :
+        return features 
+
+    base =np .asarray (features ,dtype =np .float32 )
+    n =int (base .shape [0 ])
+    aux_parts =[]
+    if reid_w >0.0 :
+        try :
+            aux_feat_list =[]
+            valid =True 
+            for s in samples :
+                aux_feat =s .get ('aux_feat',None )if isinstance (s ,dict )else None 
+                if aux_feat is None :
+                    valid =False 
+                    break 
+                aux_feat_arr =np .asarray (aux_feat ,dtype =np .float32 ).reshape (-1 )
+                if aux_feat_arr .size <=0 :
+                    valid =False 
+                    break 
+                aux_feat_list .append (aux_feat_arr )
+            if valid and len (aux_feat_list )==n :
+                aux_feat_mat =np .stack (aux_feat_list ,axis =0 )
+                aux_norms =np .linalg .norm (aux_feat_mat ,axis =1 ,keepdims =True )
+                aux_feat_mat =aux_feat_mat /np .clip (aux_norms ,1e-12 ,None )
+                aux_parts .append (aux_feat_mat *float (reid_w ))
+        except Exception :
+            pass 
+    if gender_w >0.0 :
+        try :
+            male_vals =np .asarray ([float (s .get ('male_p',0.5 )or 0.5 )for s in samples ],dtype =np .float32 )
+            male_centered =((male_vals -0.5 )*2.0 )[:,None ]
+            aux_parts .append (male_centered *float (gender_w ))
+        except Exception :
+            pass 
+    if age_w >0.0 :
+        try :
+            age_vals =np .asarray ([float (s .get ('age_p',0.0 )or 0.0 )for s in samples ],dtype =np .float32 )
+            med =float (np .median (age_vals ))
+            mad =float (np .median (np .abs (age_vals -med )))
+            scale =max (1.5 ,1.4826 *mad )
+            age_norm =((age_vals -med )/scale )[:,None ]
+            age_norm =np .clip (age_norm ,-3.0 ,3.0 )
+            aux_parts .append (age_norm *float (age_w ))
+        except Exception :
+            pass 
+    if not aux_parts :
+        return base 
+    aug =np .concatenate ([base ]+aux_parts ,axis =1 )
+    norms =np .linalg .norm (aug ,axis =1 ,keepdims =True )
+    aug =aug /np .clip (norms ,1e-12 ,None )
+    return aug .astype (np .float32 ,copy =False )
 
 
 def _extract_rois_for_twopass_image (
@@ -2514,10 +3305,16 @@ all_image_paths ,
                 except Exception :
                     use_blend =False 
             inp =torch .cat (inp_list ,dim =0 )
-            feat_after_bn ,male_probs ,age_pred =_forward_reid_and_aux (
-            inference ,inp ,crops_rgb =crops_for_aux 
+            feat_after_bn ,male_probs ,age_pred ,aux_feat_after_bn =_forward_reid_and_aux (
+            inference ,
+            inp ,
+            crops_rgb =crops_for_aux ,
+            return_aux_feat =True ,
+            fuse_aux_into_main =False ,
             )
             feat_after_bn =F .normalize (feat_after_bn ,p =2 ,dim =1 )
+            if aux_feat_after_bn is not None :
+                aux_feat_after_bn =F .normalize (aux_feat_after_bn ,p =2 ,dim =1 )
 
         if use_blend :
             roi_feat =feat_after_bn [:-1 ]
@@ -2526,6 +3323,12 @@ all_image_paths ,
             full_feat =feat_after_bn [-1 ]
             full_male =male_probs [-1 ]
             full_age =age_pred [-1 ]
+            if aux_feat_after_bn is not None and int (aux_feat_after_bn .shape [0 ])==int (feat_after_bn .shape [0 ]):
+                roi_aux_feat =aux_feat_after_bn [:-1 ]
+                full_aux_feat =aux_feat_after_bn [-1 ]
+            else :
+                roi_aux_feat =None 
+                full_aux_feat =None 
         else :
             roi_feat =feat_after_bn 
             roi_male =male_probs 
@@ -2533,22 +3336,31 @@ all_image_paths ,
             full_feat =None 
             full_male =None 
             full_age =None 
+            roi_aux_feat =aux_feat_after_bn 
+            full_aux_feat =None 
 
         for j ,r in enumerate (rois ):
             f_j =roi_feat [j ]
             male_j =roi_male [j ]
             age_j =roi_age [j ]
+            aux_f_j =None if roi_aux_feat is None else roi_aux_feat [j ]
             if use_blend and full_feat is not None :
                 f_j =F .normalize ((1.0 -blend_w )*f_j +blend_w *full_feat ,p =2 ,dim =0 )
                 male_j =(1.0 -blend_w )*male_j +blend_w *full_male 
                 age_j =(1.0 -blend_w )*age_j +blend_w *full_age 
+                if aux_f_j is not None and full_aux_feat is not None :
+                    aux_f_j =F .normalize ((1.0 -blend_w )*aux_f_j +blend_w *full_aux_feat ,p =2 ,dim =0 )
 
             feat =f_j .detach ().cpu ().numpy ().astype (np .float32 ,copy =False )
+            aux_feat_np =None 
+            if aux_f_j is not None :
+                aux_feat_np =aux_f_j .detach ().cpu ().numpy ().astype (np .float32 ,copy =False )
             samples .append ({
             'image_path':in_path ,
             'rel_path':rel_path ,
             'bbox':tuple (int (x )for x in r ['bbox']),
             'feat':feat ,
+            'aux_feat':aux_feat_np ,
             'male_p':float (male_j .item ()),
             'age_p':float (age_j .item ()),
             'roi_source':str (r .get ('roi_source','unknown')or 'unknown'),
@@ -2564,6 +3376,7 @@ all_image_paths ,
         return img_count ,0 ,detection_records 
 
     features =np .stack ([s ['feat']for s in samples ],axis =0 ).astype (np .float32 ,copy =False )
+    cluster_features =_build_aux_aware_cluster_features (features ,samples ,args )
     th_manual =float (
     getattr (args ,'twopass_threshold',None )
     if getattr (args ,'twopass_threshold',None )is not None
@@ -2576,10 +3389,16 @@ all_image_paths ,
     use_auto_th =bool (getattr (args ,'twopass_threshold_auto',True ))
     if use_auto_th :
         th ,labels ,cluster_method ,_th_stats =_auto_select_twopass_threshold (
-        features ,
+        cluster_features ,
         method =str (getattr (args ,'cluster_method','auto')or 'auto'),
         agglomerative_max_n =int (getattr (args ,'cluster_agglomerative_max_n',5000 )or 5000 ),
         momentum =float (getattr (args ,'cluster_momentum',0.9 )or 0.9 ),
+        sim_cosine_w =float (getattr (args ,'sim_cosine_w',0.7 )or 0.7 ),
+        sim_euclid_w =float (getattr (args ,'sim_euclid_w',0.3 )or 0.3 ),
+        mp_max_slots =int (getattr (args ,'prototype_max_slots',4 )or 4 ),
+        mp_spawn_similarity =float (getattr (args ,'prototype_spawn_similarity',0.68 )or 0.68 ),
+        mp_topk =int (getattr (args ,'prototype_topk',2 )or 2 ),
+        mp_aggregate_weight =float (getattr (args ,'prototype_aggregate_weight',0.75 )or 0.75 ),
         target_cluster_size =float (getattr (args ,'twopass_target_cluster_size',26.0 )or 26.0 ),
         seed =int (getattr (args ,'shuffle_seed',42 )or 42 ),
         verbose =bool (getattr (args ,'verbose',False )),
@@ -2587,22 +3406,34 @@ all_image_paths ,
     else :
         th =th_manual 
         labels ,cluster_method =_cluster_embeddings_global (
-        features ,
+        cluster_features ,
         threshold =th ,
         method =str (getattr (args ,'cluster_method','auto')or 'auto'),
         agglomerative_max_n =int (getattr (args ,'cluster_agglomerative_max_n',5000 )or 5000 ),
         momentum =float (getattr (args ,'cluster_momentum',0.9 )or 0.9 ),
+        sim_cosine_w =float (getattr (args ,'sim_cosine_w',0.7 )or 0.7 ),
+        sim_euclid_w =float (getattr (args ,'sim_euclid_w',0.3 )or 0.3 ),
+        mp_max_slots =int (getattr (args ,'prototype_max_slots',4 )or 4 ),
+        mp_spawn_similarity =float (getattr (args ,'prototype_spawn_similarity',0.68 )or 0.68 ),
+        mp_topk =int (getattr (args ,'prototype_topk',2 )or 2 ),
+        mp_aggregate_weight =float (getattr (args ,'prototype_aggregate_weight',0.75 )or 0.75 ),
         seed =int (getattr (args ,'shuffle_seed',42 )or 42 ),
         )
 
     if bool (getattr (args ,'twopass_refine_split',False )):
         labels_refined ,split_log =_refine_labels_by_secondary_split (
         labels ,
-        features ,
+        cluster_features ,
         base_threshold =float (th ),
         method =str (getattr (args ,'cluster_method','auto')or 'auto'),
         agglomerative_max_n =int (getattr (args ,'cluster_agglomerative_max_n',5000 )or 5000 ),
         momentum =float (getattr (args ,'cluster_momentum',0.9 )or 0.9 ),
+        sim_cosine_w =float (getattr (args ,'sim_cosine_w',0.7 )or 0.7 ),
+        sim_euclid_w =float (getattr (args ,'sim_euclid_w',0.3 )or 0.3 ),
+        mp_max_slots =int (getattr (args ,'prototype_max_slots',4 )or 4 ),
+        mp_spawn_similarity =float (getattr (args ,'prototype_spawn_similarity',0.68 )or 0.68 ),
+        mp_topk =int (getattr (args ,'prototype_topk',2 )or 2 ),
+        mp_aggregate_weight =float (getattr (args ,'prototype_aggregate_weight',0.75 )or 0.75 ),
         seed =int (getattr (args ,'shuffle_seed',42 )or 42 ),
         min_cluster_size =int (getattr (args ,'twopass_refine_min_size',18 )or 18 ),
         min_subcluster_size =int (getattr (args ,'twopass_refine_min_subcluster',4 )or 4 ),
@@ -2625,7 +3456,7 @@ all_image_paths ,
                 male_arr =np .array ([float (s .get ('male_p',0.5 ))for s in samples ],dtype =np .float32 )
                 labels_merged ,merge_log =_merge_labels_toward_target (
                 labels ,
-                features ,
+                cluster_features ,
                 male_probs =male_arr ,
                 target_k =target_k ,
                 min_sim =float (getattr (args ,'twopass_merge_min_sim',0.45 )or 0.45 ),
@@ -2637,6 +3468,39 @@ all_image_paths ,
                     f"[INFO] Auto-merge clusters: k {k_before}->{int(np.unique(labels).size)} "
                     f"(target={target_k}, merges={len(merge_log)})"
                     )
+
+    centroid_merge_info ={'applied':False }
+    if bool (getattr (args ,'twopass_centroid_merge',False )):
+        allow_centroid_stage =True 
+        if bool (getattr (args ,'twopass_centroid_image_only',True )):
+            allow_centroid_stage =bool (getattr (args ,'image_as_roi',False ))
+        if allow_centroid_stage :
+            male_arr =np .array ([float (s .get ('male_p',0.5 ))for s in samples ],dtype =np .float32 )
+            labels_merged2 ,centroid_merge_info =_merge_labels_by_centroid_topology (
+            labels ,
+            cluster_features ,
+            male_probs =male_arr ,
+            method =str (getattr (args ,'twopass_centroid_method','agglomerative')or 'agglomerative'),
+            auto_threshold =bool (getattr (args ,'twopass_centroid_threshold_auto',True )),
+            threshold =float (getattr (args ,'twopass_centroid_threshold',0.18 )or 0.18 ),
+            fragment_group_size =float (getattr (args ,'twopass_centroid_fragment_group_size',16.0 )or 16.0 ),
+            min_fragments =int (getattr (args ,'twopass_centroid_min_fragments',128 )or 128 ),
+            agglomerative_max_n =int (getattr (args ,'cluster_agglomerative_max_n',5000 )or 5000 ),
+            momentum =float (getattr (args ,'cluster_momentum',0.9 )or 0.9 ),
+            sim_cosine_w =float (getattr (args ,'sim_cosine_w',0.7 )or 0.7 ),
+            sim_euclid_w =float (getattr (args ,'sim_euclid_w',0.3 )or 0.3 ),
+            mp_max_slots =int (getattr (args ,'prototype_max_slots',4 )or 4 ),
+            mp_spawn_similarity =float (getattr (args ,'prototype_spawn_similarity',0.68 )or 0.68 ),
+            mp_topk =int (getattr (args ,'prototype_topk',2 )or 2 ),
+            mp_aggregate_weight =float (getattr (args ,'prototype_aggregate_weight',0.75 )or 0.75 ),
+            auto_merge =bool (getattr (args ,'twopass_centroid_auto_merge',False )),
+            merge_min_sim =float (getattr (args ,'twopass_centroid_merge_min_sim',0.40 )or 0.40 ),
+            seed =int (getattr (args ,'shuffle_seed',42 )or 42 ),
+            verbose =bool (getattr (args ,'verbose',False )),
+            )
+            if labels_merged2 is not None and bool (centroid_merge_info .get ('applied',False )):
+                labels =labels_merged2 
+                cluster_method =f"{cluster_method}+centroid-{str(centroid_merge_info.get('method','agglomerative'))}"
 
     uniq =np .unique (labels )
     cluster_info =[]
@@ -2693,6 +3557,42 @@ all_image_paths ,
     setattr (inference ,'global_gender_stats',global_gender_stats )
     setattr (inference ,'global_age_stats',global_age_stats )
 
+    gid_feature_map ={label_to_gid [lb ]:label_to_centroid [lb ]for lb in label_to_gid }
+    # Persist image cluster centroids so detection_results.json can expose
+    # identity_feature_summary for downstream raw-output topology merging.
+    try :
+        _feat_store =_identity_gid_features_store (inference )
+        for _gid ,_feat in gid_feature_map .items ():
+            _feat_store [str (_gid )]=_normalize_np_feature (_feat )
+    except Exception :
+        pass 
+    gid_to_image_paths =defaultdict (set )
+    by_image =defaultdict (list )
+    for i ,s in enumerate (samples ):
+        by_image [s ['image_path']].append (i )
+        gid_to_image_paths [label_to_gid [int (labels [i ])]].add (str (s ['image_path']))
+    for gid ,paths in gid_to_image_paths .items ():
+        for path in paths :
+            _register_gid_source (inference ,gid ,path ,'image')
+    for idxs in by_image .values ():
+        gids_in_image ={label_to_gid [int (labels [ii ])]for ii in idxs}
+        _register_conflict_pairs_from_gids (inference ,gids_in_image )
+
+    id_root =getattr (inference ,'id_group_root',None )if bool (getattr (inference ,'group_by_id',False ))else None 
+    merge_alias_map ={}
+    if bool (getattr (args ,'post_merge_enable_image',getattr (args ,'post_merge_enable',True ))):
+        merge_alias_map =_consolidate_runtime_identities (
+        inference =inference ,
+        candidate_gids =list (gid_feature_map .keys ()),
+        global_to_display =global_to_display ,
+        global_gender_stats =global_gender_stats ,
+        global_age_stats =global_age_stats ,
+        args =args ,
+        gid_feature_map =gid_feature_map ,
+        id_root =id_root ,
+        log_prefix ="image-post-merge",
+        )
+
     if len (uniq )>1 :
         centroids_mat =np .stack ([label_to_centroid [int (lb )]for lb in uniq ],axis =0 )
     else :
@@ -2702,8 +3602,11 @@ all_image_paths ,
 
     for i in range (len (samples )):
         lb =int (labels [i ])
-        gid =label_to_gid [lb ]
-        sim_same =float (np .dot (features [i ],label_to_centroid [lb ]))
+        gid =_remap_gid_to_root (label_to_gid [lb ],merge_alias_map )or label_to_gid [lb ]
+        gid_feat =_identity_gid_features_store (inference ).get (gid )
+        if gid_feat is None :
+            gid_feat =label_to_centroid [lb ]
+        sim_same =float (np .dot (features [i ],gid_feat ))
         if centroids_mat is not None and len (uniq_list )>1 :
             sims =centroids_mat @features [i ]
             sims [lb_to_pos [lb ]]=-10.0 
@@ -2716,18 +3619,6 @@ all_image_paths ,
         samples [i ]['disp_id']=global_to_display .get (gid ,gid )
         samples [i ]['sim']=sim_same 
         samples [i ]['id_conf']=id_conf 
-
-    by_image =defaultdict (list )
-    for i ,s in enumerate (samples ):
-        by_image [s ['image_path']].append (i )
-
-    merged_display_stats =_aggregate_display_identity_summary (
-    gids =set (s ['gid']for s in samples if s .get ('gid')is not None ),
-    global_to_display =global_to_display ,
-    global_gender_stats =global_gender_stats ,
-    age_stats =global_age_stats ,
-    args =args ,
-    )
 
     for in_path in all_image_paths :
         rel_path =os .path .relpath (in_path ,input_dir )
@@ -2749,35 +3640,28 @@ all_image_paths ,
             y2 =int (max (y1 +1 ,y2 ))
             gid =s ['gid']
             disp_id =s ['disp_id']
-            vis_disp_id =_customize_disp_id (disp_id ,args )
-            present_disp_ids .add (vis_disp_id )
-            merged_stat =merged_display_stats .get (vis_disp_id ,{})
-            gender =merged_stat .get ('gender')
-            gender_conf =merged_stat .get ('gender_conf')
-            age_disp =merged_stat .get ('age_mean')
-            if gender in {None ,'' ,'-'}or gender_conf is None :
-                gstat =global_gender_stats .get (gid ,{'alpha_male':1.0 ,'alpha_female':1.0 ,'stable_gender':None })
-                total =float (gstat ['alpha_male'])+float (gstat ['alpha_female'])
-                male_mean =float (gstat ['alpha_male'])/max (1e-6 ,total )
-                gender =gstat .get ('stable_gender')or ('M'if male_mean >=float (args .gender_threshold )else 'F')
-                gender_conf =_gender_confidence_01 (male_mean ,stable_gender =gender ,threshold =args .gender_threshold )
-            if age_disp is None :
-                ages =global_age_stats .get (gid ,[])
-                if str (getattr (args ,'age_display','median')).lower ()=='mean'and len (ages )>0 :
-                    age_disp =float (np .mean (ages ))
-                elif str (getattr (args ,'age_display','median')).lower ()=='instant':
-                    age_disp =float (s ['age_p'])
-                else :
-                    age_disp =float (np .median (ages ))if len (ages )>0 else float (s ['age_p'])
+            present_disp_ids .add (disp_id )
 
-            txt =_build_vis_text (
-            args =args ,
-            disp_id =disp_id ,
-            gender =gender ,
-            gender_conf =gender_conf ,
-            age =age_disp ,
-            id_conf =float (s ['id_conf']),
-            )
+            gstat =global_gender_stats .get (gid ,{'alpha_male':1.0 ,'alpha_female':1.0 ,'stable_gender':None })
+            total =float (gstat ['alpha_male'])+float (gstat ['alpha_female'])
+            male_mean =float (gstat ['alpha_male'])/max (1e-6 ,total )
+            gender =gstat .get ('stable_gender')or ('M'if male_mean >=float (args .gender_threshold )else 'F')
+            gender_conf =_gender_confidence_01 (male_mean ,stable_gender =gender ,threshold =args .gender_threshold )
+
+            ages =global_age_stats .get (gid ,[])
+            if str (getattr (args ,'age_display','median')).lower ()=='mean'and len (ages )>0 :
+                age_disp =float (np .mean (ages ))
+            elif str (getattr (args ,'age_display','median')).lower ()=='instant':
+                age_disp =float (s ['age_p'])
+            else :
+                age_disp =float (np .median (ages ))if len (ages )>0 else float (s ['age_p'])
+
+            txt =' | '.join ([
+            disp_id ,
+            f"{gender}_conf:{gender_conf:.2f}",
+            f"Age:{age_disp:.0f}",
+            f"id_conf:{float(s['id_conf']):.2f}",
+            ])
             font ,font_scale ,thickness ,pad_txt =_get_adaptive_text_style (
             frame_bgr ,base_scale =0.82 ,min_scale =0.62 ,max_scale =2.7 
             )
@@ -2801,12 +3685,11 @@ all_image_paths ,
             border_color =color ,
             )
 
-            id_info_map [vis_disp_id ]={'gender':gender ,'age':age_disp }
+            id_info_map [disp_id ]={'gender':gender ,'age':age_disp }
             detection_details .append ({
             'rel_path':rel_path ,
             'true_id':_first_folder_of_rel_path (rel_path ),
-            'display_id':vis_disp_id ,
-            'raw_display_id':disp_id ,
+            'display_id':disp_id ,
             'global_id':gid ,
             'bbox':[int (x1 ),int (y1 ),int (x2 ),int (y2 )],
             'gender':gender ,
@@ -2848,6 +3731,11 @@ all_image_paths ,
     'threshold_mode':('auto' if bool (getattr (args ,'twopass_threshold_auto',True ))else 'manual'),
     'num_rois':int (len (samples )),
     'num_ids':int (len (cluster_info )),
+    'centroid_merge_applied':bool (centroid_merge_info .get ('applied',False )),
+    'centroid_merge_stage1_fragments':int (centroid_merge_info .get ('stage1_fragments',0 )or 0 ),
+    'centroid_merge_stage2_clusters':int (centroid_merge_info .get ('stage2_clusters',0 )or 0 ),
+    'centroid_merge_threshold':float (centroid_merge_info .get ('threshold',0.0 )or 0.0 ),
+    'centroid_merge_method':str (centroid_merge_info .get ('method','')),
     'fallback_saved':int (fallback_saved ),
     }
     setattr (inference ,'_last_detection_details',detection_details )
@@ -3047,17 +3935,15 @@ def run_image (args ,inference ,yolo ,sam_predictor ,device ,*,input_rel_path :O
             if not candidates :
                 candidates =list (candidate_ids )
 
-            pn =inference .prototype_net 
-            sims ={}
-            for cid in candidates :
-                if cid in getattr (pn ,'prototypes',{}):
-                    try :
-                        sim ,_ =pn .compute_similarity_with_confidence (
-                        f ,pn .prototypes [cid ],id_name =cid ,aux =aux 
-                        )
-                        sims [cid ]=float (sim )
-                    except Exception :
-                        pass 
+            res =_match_identity_with_strategy (
+            inference ,
+            f ,
+            aux =aux ,
+            reserved_ids =used_ids_in_image ,
+            candidate_ids =candidates ,
+            allow_new =False ,
+            )
+            sims =res .get ('all_similarities',{})or {}
 
             gid =None 
             best_score =None 
@@ -3070,8 +3956,16 @@ def run_image (args ,inference ,yolo ,sam_predictor ,device ,*,input_rel_path :O
             if gid is None :
                 continue 
             sim_for_log =float (sims .get (gid ,0.0 )or 0.0 )
+            _adaptive_th =float (res .get ('adaptive_threshold',_adaptive_th )or _adaptive_th )
         else :
-            res =inference .prototype_net (f ,aux =aux )
+            res =_match_identity_with_strategy (
+            inference ,
+            f ,
+            aux =aux ,
+            reserved_ids =used_ids_in_image ,
+            candidate_ids =None ,
+            allow_new =True ,
+            )
             gid ,sim_for_log ,_created_new ,_adaptive_th =_pick_global_id_from_prototype_result (
             res ,inference ,used_ids_in_image ,allow_new =True 
             )
@@ -3094,8 +3988,14 @@ def run_image (args ,inference ,yolo ,sam_predictor ,device ,*,input_rel_path :O
         min_upd_conf =float (getattr (args ,'update_existing_min_id_conf',0.55 )or 0.55 )
         should_update =(bool (_created_new )or (id_conf >=min_upd_conf ))
         if should_update :
-            inference .prototype_net .update_prototype (
-            gid ,f ,quality_score ,gender_prob =male_p ,age_pred =age_p 
+            _update_identity_memory (
+            inference ,
+            gid ,
+            f ,
+            quality_score ,
+            gender_prob =male_p ,
+            age_pred =age_p ,
+            id_conf =id_conf ,
             )
         assignments [i ]={'gid':gid ,'male_p':male_p ,'age_p':age_p ,'sim':sim_for_log ,'id_conf':id_conf }
         # 
@@ -3106,14 +4006,7 @@ def run_image (args ,inference ,yolo ,sam_predictor ,device ,*,input_rel_path :O
         setattr (inference ,'next_display_id',next_display_id )
 
 
-    merged_display_stats =_aggregate_display_identity_summary (
-    gids =set (assign ['gid']for assign in assignments .values ()if assign .get ('gid')is not None ),
-    global_to_display =global_to_display ,
-    global_gender_stats =global_gender_stats ,
-    age_stats =global_age_stats ,
-    args =args ,
-    )
-
+        
     frame_bgr_orig =frame_bgr .copy ()
     overlay_items =[]# D
     for i ,(x1 ,y1 ,x2 ,y2 )in enumerate (kept_boxes ):
@@ -3151,21 +4044,15 @@ def run_image (args ,inference ,yolo ,sam_predictor ,device ,*,input_rel_path :O
             gender =gstat ['stable_gender']
             age_disp =float (age_p )
 
-        vis_disp_id =_customize_disp_id (disp_id ,args )
-        merged_stat =merged_display_stats .get (vis_disp_id ,{})
-        gender =merged_stat .get ('gender',gender )
-        gender_conf =merged_stat .get ('gender_conf')
-        age_disp =merged_stat .get ('age_mean',age_disp )
-        if gender_conf is None :
-            gender_conf =_gender_confidence_01 (male_mean ,stable_gender =gender ,threshold =args .gender_threshold )
-        txt =_build_vis_text (
-        args =args ,
-        disp_id =disp_id ,
-        gender =gender ,
-        gender_conf =gender_conf ,
-        age =age_disp ,
-        id_conf =assignments [i ]['id_conf'],
-        )
+        gender_conf =_gender_confidence_01 (male_mean ,stable_gender =gender ,threshold =args .gender_threshold )
+        age_str =f"Age:{age_disp:.0f}"
+
+        txt =' | '.join ([
+        disp_id ,
+        f"{gender}_conf:{gender_conf :.2f}",
+        age_str ,
+        f"id_conf:{assignments[i]['id_conf']:.2f}",
+        ])
         font ,font_scale ,thickness ,pad_txt =_get_adaptive_text_style (
         frame_bgr ,base_scale =0.82 ,min_scale =0.62 ,max_scale =2.7 
         )
@@ -3194,8 +4081,7 @@ def run_image (args ,inference ,yolo ,sam_predictor ,device ,*,input_rel_path :O
 
         
         overlay_items .append ({
-        'disp_id':vis_disp_id ,
-        'raw_display_id':disp_id ,
+        'disp_id':disp_id ,
         'gender':gender ,
         'gender_conf':gender_conf ,
         'age':age_disp ,
@@ -3349,6 +4235,7 @@ def run_video_dirmode (args ,inference ,yolo ,sam_predictor ,device ,*,input_rel
     persist =True ,
     verbose =False ,
     workers =0 ,
+    vid_stride =int (getattr (args ,'vid_stride',1 )or 1 ),
     )
     if args .verbose :
         print ("[INFO] Running YOLO detection...")
@@ -3590,6 +4477,56 @@ def run_video_dirmode (args ,inference ,yolo ,sam_predictor ,device ,*,input_rel
     n_frames =len (frame_detections )if frame_detections is not None else (frame_idx +1 )
     print (f"[INFO] Processed {n_frames} frames, tracked IDs: {len(seen_gids)}")
 
+    for gid in list (seen_gids ):
+        _register_gid_source (inference ,gid ,input_rel_path or args .input ,'video')
+    if frame_detections is not None :
+        for xyxy ,ids in frame_detections :
+            if ids is None :
+                continue 
+            frame_gids =set ()
+            for tid_raw in ids :
+                try :
+                    tid =int (tid_raw )
+                except Exception :
+                    continue 
+                info =finalized_track_map .get (tid )or track_states .get (tid )or {}
+                gid =info .get ('global_id')
+                if gid :
+                    frame_gids .add (str (gid ))
+            _register_conflict_pairs_from_gids (inference ,frame_gids )
+
+    id_root =getattr (inference ,'id_group_root',None )if bool (getattr (inference ,'group_by_id',False ))else None 
+    merge_alias_map ={}
+    if bool (getattr (args ,'post_merge_enable_video',getattr (args ,'post_merge_enable',True ))):
+        merge_alias_map =_consolidate_runtime_identities (
+        inference =inference ,
+        candidate_gids =list (getattr (inference ,'global_to_display',{}).keys ()),
+        global_to_display =global_to_display ,
+        global_gender_stats =global_gender_stats ,
+        global_age_stats =global_age_stats ,
+        args =args ,
+        gid_feature_map =None ,
+        id_root =id_root ,
+        log_prefix =f"video-post-merge:{os.path.basename(args.input)}",
+        )
+    if merge_alias_map :
+        for child_gid ,root_gid in list (merge_alias_map .items ()):
+            if child_gid in video_age_stats :
+                video_age_stats [root_gid ].extend (list (video_age_stats .pop (child_gid ,[])or []))
+        seen_gids ={_remap_gid_to_root (gid ,merge_alias_map )or gid for gid in seen_gids}
+        for tid ,info in finalized_track_map .items ():
+            gid =info .get ('global_id')
+            if gid :
+                gid =_remap_gid_to_root (gid ,merge_alias_map )or gid 
+                info ['global_id']=gid 
+                info ['display_id']=global_to_display .get (gid ,gid )
+        for tid ,state in track_states .items ():
+            gid =state .get ('global_id')
+            if gid :
+                gid =_remap_gid_to_root (gid ,merge_alias_map )or gid 
+                state ['global_id']=gid 
+                state ['display_id']=global_to_display .get (gid ,gid )
+
     # +DID
     if getattr (inference ,'group_by_id',False )and len (seen_gids )==0 :
         if getattr (args ,'verbose',False ):
@@ -3599,13 +4536,41 @@ def run_video_dirmode (args ,inference ,yolo ,sam_predictor ,device ,*,input_rel
     if not save_vis :
         if getattr (args ,'verbose',False ):
             print ("[WARN] save_vis=0: visualization video will not be written.")
-        summary =_aggregate_display_identity_summary (
-        gids =seen_gids ,
-        global_to_display =global_to_display ,
-        global_gender_stats =global_gender_stats ,
-        age_stats =video_age_stats ,
-        args =args ,
-        )
+        summary ={}
+        for gid in seen_gids :
+        # ID/
+            forced_meta =_ID_META .get (gid )
+            if forced_meta is not None :
+                gender =forced_meta .get ('gender')or 'F'
+                male_mean =1.0 if gender =='M'else 0.0 
+                try :
+                    age_mean =float (forced_meta .get ('age'))if forced_meta .get ('age')is not None else None 
+                except Exception :
+                    age_mean =None 
+                summary [gid ]={
+                'display_id':global_to_display .get (gid ,gid if _is_canonical_id_name (gid )else ''),
+                'gender':gender ,
+                'male_mean':male_mean ,
+                'gender_conf':_gender_confidence_01 (male_mean ,stable_gender =gender ,threshold =args .gender_threshold ),
+                'age_mean':age_mean ,
+                }
+                continue 
+
+            gstat =global_gender_stats .get (gid )
+            if not gstat :
+                continue 
+            total =gstat ['alpha_male']+gstat ['alpha_female']
+            male_mean =float (gstat ['alpha_male']/max (1e-6 ,total ))
+            gender =gstat .get ('stable_gender')or ('M'if male_mean >=args .gender_threshold else 'F')
+            ages =video_age_stats .get (gid ,[])
+            age_mean =float (np .mean (ages ))if len (ages )>0 else None 
+            summary [gid ]={
+            'display_id':global_to_display .get (gid ,''),
+            'gender':gender ,
+            'male_mean':male_mean ,
+            'gender_conf':_gender_confidence_01 (male_mean ,stable_gender =gender ,threshold =args .gender_threshold ),
+            'age_mean':age_mean ,
+            }
 
             
         if frame_detections is not None :
@@ -3632,13 +4597,6 @@ def run_video_dirmode (args ,inference ,yolo ,sam_predictor ,device ,*,input_rel
 
     frame_idx =-1 
     frames_written =0 
-    merged_display_stats =_aggregate_display_identity_summary (
-    gids =seen_gids ,
-    global_to_display =global_to_display ,
-    global_gender_stats =global_gender_stats ,
-    age_stats =video_age_stats ,
-    args =args ,
-    )
 
     while True :
         ret ,frame_bgr =cap2 .read ()
@@ -3712,28 +4670,20 @@ def run_video_dirmode (args ,inference ,yolo ,sam_predictor ,device ,*,input_rel
                             age_txt =float (np .mean (ages ))if age_display =='mean'else float (np .median (ages ))
 
                             # 
-                gender_conf =None 
+                disp =[disp_id ]
                 if gender_txt is not None and male_mean is not None :
                     gender_conf =_gender_confidence_01 (male_mean ,stable_gender =gender_txt ,threshold =args .gender_threshold )
+                    disp .append (f"{gender_txt}_conf:{gender_conf :.2f}")
+                if age_txt is not None :
+                    disp .append (f"Age:{age_txt:.0f}")
                 id_conf =None 
                 if track_info and track_info .get ('id_confidence')is not None :
                     id_conf =float (track_info ['id_confidence'])
                 elif similarity is not None :
                     id_conf =_identity_confidence_01 (similarity ,adaptive_th =getattr (args ,'base_threshold',None ),is_new =False )
-                vis_disp_id =_customize_disp_id (disp_id ,args )
-                merged_stat =merged_display_stats .get (vis_disp_id ,{})
-                if merged_stat :
-                    gender_txt =merged_stat .get ('gender',gender_txt )
-                    gender_conf =merged_stat .get ('gender_conf',gender_conf )
-                    age_txt =merged_stat .get ('age_mean',age_txt )
-                txt =_build_vis_text (
-                args =args ,
-                disp_id =disp_id ,
-                gender =gender_txt ,
-                gender_conf =gender_conf ,
-                age =age_txt ,
-                id_conf =id_conf ,
-                )
+                if id_conf is not None :
+                    disp .append (f"id_conf:{id_conf :.2f}")
+                txt =' | '.join (disp )
 
                 # 
                 font ,font_scale ,thickness ,pad_txt =_get_adaptive_text_style (
@@ -3774,7 +4724,7 @@ def run_video_dirmode (args ,inference ,yolo ,sam_predictor ,device ,*,input_rel
     if getattr (inference ,'group_by_id',False ):
         id_root =getattr (inference ,'id_group_root',None )or os .path .dirname (args .output )
         print (f" trk -> ID..")
-        _reorganize_folders_by_id (id_root ,finalized_track_map ,global_to_display ,args =args )
+        _reorganize_folders_by_id (id_root ,finalized_track_map ,global_to_display )
 
         try :
             src_video =args .output 
@@ -3792,7 +4742,7 @@ def run_video_dirmode (args ,inference ,yolo ,sam_predictor ,device ,*,input_rel
             if info .get ('display_id')and not info .get ('skipped')
             }
             for disp_id in disp_ids_for_video :
-                dst_dir =os .path .join (id_root ,_customize_disp_id (disp_id ,args ))
+                dst_dir =os .path .join (id_root ,disp_id )
                 os .makedirs (dst_dir ,exist_ok =True )
                 dst_path =os .path .join (dst_dir ,save_name )
                 shutil .copy2 (src_video ,dst_path )
@@ -3816,13 +4766,41 @@ def run_video_dirmode (args ,inference ,yolo ,sam_predictor ,device ,*,input_rel
                 print (f"[WARN] : {e}")
 
                 
-    summary =_aggregate_display_identity_summary (
-    gids =seen_gids ,
-    global_to_display =global_to_display ,
-    global_gender_stats =global_gender_stats ,
-    age_stats =video_age_stats ,
-    args =args ,
-    )
+    summary ={}
+    for gid in seen_gids :
+    # ID/
+        forced_meta =_ID_META .get (gid )
+        if forced_meta is not None :
+            gender =forced_meta .get ('gender')or 'F'
+            male_mean =1.0 if gender =='M'else 0.0 
+            try :
+                age_mean =float (forced_meta .get ('age'))if forced_meta .get ('age')is not None else None 
+            except Exception :
+                age_mean =None 
+            summary [gid ]={
+            'display_id':global_to_display .get (gid ,gid if _is_canonical_id_name (gid )else ''),
+            'gender':gender ,
+            'male_mean':male_mean ,
+            'gender_conf':_gender_confidence_01 (male_mean ,stable_gender =gender ,threshold =args .gender_threshold ),
+            'age_mean':age_mean ,
+            }
+            continue 
+
+        gstat =global_gender_stats .get (gid )
+        if not gstat :
+            continue 
+        total =gstat ['alpha_male']+gstat ['alpha_female']
+        male_mean =float (gstat ['alpha_male']/max (1e-6 ,total ))
+        gender =gstat .get ('stable_gender')or ('M'if male_mean >=args .gender_threshold else 'F')
+        ages =video_age_stats .get (gid ,[])
+        age_mean =float (np .mean (ages ))if len (ages )>0 else None 
+        summary [gid ]={
+        'display_id':global_to_display .get (gid ,''),
+        'gender':gender ,
+        'male_mean':male_mean ,
+        'gender_conf':_gender_confidence_01 (male_mean ,stable_gender =gender ,threshold =args .gender_threshold ),
+        'age_mean':age_mean ,
+        }
 
     if not getattr (inference ,'group_by_id',False ):
         print (f" {args.output}")
@@ -3841,6 +4819,7 @@ def run ():
     args =parse_args ()
     _user_base_threshold =args .base_threshold 
     _user_twopass_threshold =getattr (args ,'twopass_threshold',None )
+    _user_model_path =args .model_path
 
     
     
@@ -3896,22 +4875,30 @@ def run ():
     if getattr (args ,'aux_feature_fuse_weight',None )is None :
         args .aux_feature_fuse_weight =USER_DEFAULTS .get ('aux_feature_fuse_weight',0.0 )
     args .aux_feature_fuse_weight =float (min (1.0 ,max (0.0 ,float (args .aux_feature_fuse_weight ))))
+    if getattr (args ,'prototype_strategy',None )is None :
+        args .prototype_strategy =USER_DEFAULTS .get ('prototype_strategy','single')
+    args .prototype_strategy =str (args .prototype_strategy or 'single').lower ()
+    if getattr (args ,'prototype_max_slots',None )is None :
+        args .prototype_max_slots =USER_DEFAULTS .get ('prototype_max_slots',4 )
+    args .prototype_max_slots =int (max (1 ,int (args .prototype_max_slots )))
+    if getattr (args ,'prototype_spawn_similarity',None )is None :
+        args .prototype_spawn_similarity =USER_DEFAULTS .get ('prototype_spawn_similarity',0.68 )
+    args .prototype_spawn_similarity =float (args .prototype_spawn_similarity )
+    if getattr (args ,'prototype_update_similarity',None )is None :
+        args .prototype_update_similarity =USER_DEFAULTS .get ('prototype_update_similarity',0.58 )
+    args .prototype_update_similarity =float (args .prototype_update_similarity )
+    if getattr (args ,'prototype_topk',None )is None :
+        args .prototype_topk =USER_DEFAULTS .get ('prototype_topk',2 )
+    args .prototype_topk =int (max (1 ,int (args .prototype_topk )))
+    if getattr (args ,'prototype_aggregate_weight',None )is None :
+        args .prototype_aggregate_weight =USER_DEFAULTS .get ('prototype_aggregate_weight',0.75 )
+    args .prototype_aggregate_weight =float (max (0.0 ,min (1.0 ,float (args .prototype_aggregate_weight ))))
         
     if getattr (args ,'save_vis',None )is None :
         args .save_vis =USER_DEFAULTS .get ('save_vis',True )
     args .save_vis =bool (int (args .save_vis ))if isinstance (args .save_vis ,(int ,np .integer ))else bool (args .save_vis )
     if not getattr (args ,'group_by_id',False ):
         args .group_by_id =USER_DEFAULTS .get ('group_by_id',False )
-    args .vis_id_alias =USER_DEFAULTS .get ('vis_id_alias',{})
-    args .vis_manual_text =USER_DEFAULTS .get ('vis_manual_text',{})
-    args .vis_id_prefix =USER_DEFAULTS .get ('vis_id_prefix','')
-    args .vis_text_template =USER_DEFAULTS .get ('vis_text_template',DEFAULT_VIS_TEXT_TEMPLATE )
-    args ._vis_id_alias_map =_parse_vis_id_alias_map (args .vis_id_alias )
-    args ._vis_manual_text_map =_parse_vis_id_alias_map (args .vis_manual_text )
-    print (
-    f"[INFO] Manual display remap enabled: alias_count={len(args._vis_id_alias_map)}, "
-    f"manual_text_count={len(args._vis_manual_text_map)}"
-    )
     if getattr (args ,'image_as_roi',None )is None :
         args .image_as_roi =USER_DEFAULTS .get ('image_as_roi',None )
     if getattr (args ,'roi_vis_use_detector',None )is None :
@@ -3990,6 +4977,15 @@ def run ():
     if getattr (args ,'twopass_full_image_weight',None )is None :
         args .twopass_full_image_weight =USER_DEFAULTS .get ('twopass_full_image_weight',0.35 )
     args .twopass_full_image_weight =float (max (0.0 ,min (1.0 ,float (args .twopass_full_image_weight ))))
+    if getattr (args ,'twopass_cluster_aux_reid_weight',None )is None :
+        args .twopass_cluster_aux_reid_weight =USER_DEFAULTS .get ('twopass_cluster_aux_reid_weight',0.0 )
+    args .twopass_cluster_aux_reid_weight =float (max (0.0 ,min (1.0 ,float (args .twopass_cluster_aux_reid_weight ))))
+    if getattr (args ,'twopass_cluster_aux_gender_weight',None )is None :
+        args .twopass_cluster_aux_gender_weight =USER_DEFAULTS .get ('twopass_cluster_aux_gender_weight',0.0 )
+    args .twopass_cluster_aux_gender_weight =float (max (0.0 ,min (1.0 ,float (args .twopass_cluster_aux_gender_weight ))))
+    if getattr (args ,'twopass_cluster_aux_age_weight',None )is None :
+        args .twopass_cluster_aux_age_weight =USER_DEFAULTS .get ('twopass_cluster_aux_age_weight',0.0 )
+    args .twopass_cluster_aux_age_weight =float (max (0.0 ,min (1.0 ,float (args .twopass_cluster_aux_age_weight ))))
     if getattr (args ,'twopass_auto_merge',None )is None :
         args .twopass_auto_merge =USER_DEFAULTS .get ('twopass_auto_merge',False )
     args .twopass_auto_merge =bool (int (args .twopass_auto_merge ))if isinstance (args .twopass_auto_merge ,(int ,np .integer ))else bool (args .twopass_auto_merge )
@@ -4011,6 +5007,70 @@ def run ():
     if getattr (args ,'twopass_refine_min_subcluster',None )is None :
         args .twopass_refine_min_subcluster =USER_DEFAULTS .get ('twopass_refine_min_subcluster',4 )
     args .twopass_refine_min_subcluster =int (max (2 ,int (args .twopass_refine_min_subcluster )))
+    if getattr (args ,'twopass_centroid_merge',None )is None :
+        args .twopass_centroid_merge =USER_DEFAULTS .get ('twopass_centroid_merge',False )
+    args .twopass_centroid_merge =bool (int (args .twopass_centroid_merge ))if isinstance (args .twopass_centroid_merge ,(int ,np .integer ))else bool (args .twopass_centroid_merge )
+    if getattr (args ,'twopass_centroid_image_only',None )is None :
+        args .twopass_centroid_image_only =USER_DEFAULTS .get ('twopass_centroid_image_only',True )
+    args .twopass_centroid_image_only =bool (int (args .twopass_centroid_image_only ))if isinstance (args .twopass_centroid_image_only ,(int ,np .integer ))else bool (args .twopass_centroid_image_only )
+    if getattr (args ,'twopass_centroid_min_fragments',None )is None :
+        args .twopass_centroid_min_fragments =USER_DEFAULTS .get ('twopass_centroid_min_fragments',128 )
+    args .twopass_centroid_min_fragments =int (max (2 ,int (args .twopass_centroid_min_fragments )))
+    if getattr (args ,'twopass_centroid_method',None )is None :
+        args .twopass_centroid_method =USER_DEFAULTS .get ('twopass_centroid_method','agglomerative')
+    args .twopass_centroid_method =str (args .twopass_centroid_method or 'agglomerative').lower ()
+    if getattr (args ,'twopass_centroid_threshold_auto',None )is None :
+        args .twopass_centroid_threshold_auto =USER_DEFAULTS .get ('twopass_centroid_threshold_auto',True )
+    args .twopass_centroid_threshold_auto =bool (int (args .twopass_centroid_threshold_auto ))if isinstance (args .twopass_centroid_threshold_auto ,(int ,np .integer ))else bool (args .twopass_centroid_threshold_auto )
+    if getattr (args ,'twopass_centroid_threshold',None )is None :
+        args .twopass_centroid_threshold =USER_DEFAULTS .get ('twopass_centroid_threshold',0.18 )
+    args .twopass_centroid_threshold =float (max (0.0 ,min (1.0 ,float (args .twopass_centroid_threshold ))))
+    if getattr (args ,'twopass_centroid_fragment_group_size',None )is None :
+        args .twopass_centroid_fragment_group_size =USER_DEFAULTS .get ('twopass_centroid_fragment_group_size',16.0 )
+    args .twopass_centroid_fragment_group_size =float (max (1.0 ,float (args .twopass_centroid_fragment_group_size )))
+    if getattr (args ,'twopass_centroid_auto_merge',None )is None :
+        args .twopass_centroid_auto_merge =USER_DEFAULTS .get ('twopass_centroid_auto_merge',False )
+    args .twopass_centroid_auto_merge =bool (int (args .twopass_centroid_auto_merge ))if isinstance (args .twopass_centroid_auto_merge ,(int ,np .integer ))else bool (args .twopass_centroid_auto_merge )
+    if getattr (args ,'twopass_centroid_merge_min_sim',None )is None :
+        args .twopass_centroid_merge_min_sim =USER_DEFAULTS .get ('twopass_centroid_merge_min_sim',0.40 )
+    args .twopass_centroid_merge_min_sim =float (max (-1.0 ,min (1.0 ,float (args .twopass_centroid_merge_min_sim ))))
+
+    if getattr (args ,'post_merge_enable',None )is None :
+        args .post_merge_enable =USER_DEFAULTS .get ('post_merge_enable',True )
+    args .post_merge_enable =bool (int (args .post_merge_enable ))if isinstance (args .post_merge_enable ,(int ,np .integer ))else bool (args .post_merge_enable )
+    if getattr (args ,'post_merge_enable_video',None )is None :
+        args .post_merge_enable_video =USER_DEFAULTS .get ('post_merge_enable_video',args .post_merge_enable )
+    args .post_merge_enable_video =bool (int (args .post_merge_enable_video ))if isinstance (args .post_merge_enable_video ,(int ,np .integer ))else bool (args .post_merge_enable_video )
+    if getattr (args ,'post_merge_enable_image',None )is None :
+        args .post_merge_enable_image =USER_DEFAULTS .get ('post_merge_enable_image',args .post_merge_enable )
+    args .post_merge_enable_image =bool (int (args .post_merge_enable_image ))if isinstance (args .post_merge_enable_image ,(int ,np .integer ))else bool (args .post_merge_enable_image )
+    if getattr (args ,'post_merge_video_min_sim',None )is None :
+        args .post_merge_video_min_sim =USER_DEFAULTS .get ('post_merge_video_min_sim',0.41 )
+    args .post_merge_video_min_sim =float (args .post_merge_video_min_sim )
+    if getattr (args ,'post_merge_image_min_sim',None )is None :
+        args .post_merge_image_min_sim =USER_DEFAULTS .get ('post_merge_image_min_sim',0.56 )
+    args .post_merge_image_min_sim =float (args .post_merge_image_min_sim )
+    if getattr (args ,'post_merge_mixed_min_sim',None )is None :
+        args .post_merge_mixed_min_sim =USER_DEFAULTS .get ('post_merge_mixed_min_sim',0.52 )
+    args .post_merge_mixed_min_sim =float (args .post_merge_mixed_min_sim )
+    if getattr (args ,'post_merge_gender_conf_guard',None )is None :
+        args .post_merge_gender_conf_guard =USER_DEFAULTS .get ('post_merge_gender_conf_guard',0.80 )
+    args .post_merge_gender_conf_guard =float (args .post_merge_gender_conf_guard )
+    if getattr (args ,'post_merge_age_gap_soft',None )is None :
+        args .post_merge_age_gap_soft =USER_DEFAULTS .get ('post_merge_age_gap_soft',3.0 )
+    args .post_merge_age_gap_soft =float (args .post_merge_age_gap_soft )
+    if getattr (args ,'post_merge_age_gap_hard',None )is None :
+        args .post_merge_age_gap_hard =USER_DEFAULTS .get ('post_merge_age_gap_hard',6.0 )
+    args .post_merge_age_gap_hard =float (args .post_merge_age_gap_hard )
+    if getattr (args ,'post_merge_fragment_relax',None )is None :
+        args .post_merge_fragment_relax =USER_DEFAULTS .get ('post_merge_fragment_relax',0.04 )
+    args .post_merge_fragment_relax =float (args .post_merge_fragment_relax )
+    if getattr (args ,'post_merge_tiny_image_max_size',None )is None :
+        args .post_merge_tiny_image_max_size =USER_DEFAULTS .get ('post_merge_tiny_image_max_size',3 )
+    args .post_merge_tiny_image_max_size =int (max (1 ,int (args .post_merge_tiny_image_max_size )))
+    if getattr (args ,'post_merge_tiny_image_min_sim',None )is None :
+        args .post_merge_tiny_image_min_sim =USER_DEFAULTS .get ('post_merge_tiny_image_min_sim',0.44 )
+    args .post_merge_tiny_image_min_sim =float (args .post_merge_tiny_image_min_sim )
 
         
     if getattr (args ,'yolo_repo_root',None )is None :
@@ -4028,6 +5088,9 @@ def run ():
         args .tracker =USER_DEFAULTS .get ('tracker')
     if args .sec_interval is None :
         args .sec_interval =USER_DEFAULTS .get ('sec_interval')
+    if getattr (args ,'vid_stride',None )is None :
+        args .vid_stride =USER_DEFAULTS .get ('vid_stride',1 )
+    args .vid_stride =int (max (1 ,int (args .vid_stride or 1 )))
     if args .max_keep_missing_sec is None :
         args .max_keep_missing_sec =USER_DEFAULTS .get ('max_keep_missing_sec')
 
@@ -4036,6 +5099,54 @@ def run ():
     
     _image_exts ={'.jpg','.jpeg','.png','.bmp','.tif','.tiff','.webp'}
     _video_exts ={'.mp4','.avi','.mov','.mkv','.wmv','.flv','.webm','.ts','.m4v'}
+
+    def _detect_input_kind (input_path :str )->str :
+        if not input_path :
+            return 'unknown'
+        if os .path .isdir (input_path ):
+            has_img =False 
+            has_vid =False 
+            for root ,dirs ,files in os .walk (input_path ):
+                for name in files :
+                    ext =os .path .splitext (name )[1 ].lower ()
+                    if ext in _image_exts :
+                        has_img =True 
+                    elif ext in _video_exts :
+                        has_vid =True 
+                    if has_img and has_vid :
+                        return 'mixed_dir'
+            if has_img :
+                return 'image_dir'
+            if has_vid :
+                return 'video_dir'
+            return 'empty_dir'
+        ext =os .path .splitext (input_path )[1 ].lower ()
+        if ext in _image_exts :
+            return 'image_file'
+        if ext in _video_exts :
+            return 'video_file'
+        img_try =_imread_unicode (input_path )
+        if img_try is not None :
+            return 'image_file'
+        cap_try =cv2 .VideoCapture (input_path )
+        is_video =cap_try .isOpened ()
+        cap_try .release ()
+        if is_video :
+            return 'video_file'
+        return 'unknown'
+
+    input_kind =_detect_input_kind (args .input )
+    if _user_model_path is None :
+        mode_model_path =None 
+        if input_kind in {'image_dir','image_file'}:
+            mode_model_path =USER_DEFAULTS .get ('image_model_path')or USER_DEFAULTS .get ('model_path')
+        elif input_kind in {'video_dir','video_file'}:
+            mode_model_path =USER_DEFAULTS .get ('video_model_path')or USER_DEFAULTS .get ('model_path')
+        if mode_model_path :
+            args .model_path =mode_model_path 
+            if bool (getattr (args ,'verbose',False )):
+                print (f"[INFO] Auto-selected model_path for {input_kind}: {args.model_path}")
+
     if os .path .isdir (args .input ):
         input_dir =args .input 
         
@@ -4107,7 +5218,7 @@ def run ():
         elif not _HAS_SAM :
             print ("[WARN] segment_anything not available, SAM refinement is disabled.")
         else :
-            sam_ckpt =os .path .join (os .path .dirname (__file__ ),'SAMmodel','sam_vit_h_4b8939.pth')
+            sam_ckpt =os .path .join (PROJECT_ROOT ,'weights','sam_vit_h_4b8939.pth')
             if os .path .isfile (sam_ckpt ):
                 sam =sam_model_registry .get ('vit_h',None )
                 if sam is not None :
@@ -4128,6 +5239,22 @@ def run ():
                     all_image_paths .append (full_path )
                 elif ext in _video_exts :
                     all_video_paths .append (full_path )
+
+        if getattr (args ,'file_list',None ):
+            selected_paths =set ()
+            try :
+                with open (args .file_list ,'r',encoding ='utf-8')as _fl :
+                    for _line in _fl :
+                        _item =_line .strip ().strip ('"')
+                        if not _item :
+                            continue 
+                        _path =_item if os .path .isabs (_item )else os .path .join (input_dir ,_item )
+                        selected_paths .add (os .path .normcase (os .path .abspath (_path )))
+                all_image_paths =[p for p in all_image_paths if os .path .normcase (os .path .abspath (p ))in selected_paths ]
+                all_video_paths =[p for p in all_video_paths if os .path .normcase (os .path .abspath (p ))in selected_paths ]
+                print (f"[INFO] Applied --file-list: {len(selected_paths)} requested, {len(all_image_paths)} images and {len(all_video_paths)} videos selected.")
+            except Exception as _file_list_e :
+                raise RuntimeError (f"Failed to read --file-list {args.file_list}: {_file_list_e}")
 
         print (f"[INFO] Found {len(all_image_paths)} images and {len(all_video_paths)} videos.")
         if args .shuffle_images and len (all_image_paths )>1 :
@@ -4200,7 +5327,6 @@ def run ():
                         gender =v .get ('gender','-')
                         age =v .get ('age_mean')
                         vid_records .append ((disp_id ,gender ,age ))
-                    vid_records =_compress_detection_id_records (vid_records ,args )
                     if vid_records :
                         detection_records .append ((rel_path ,vid_records ))
                 print (f"[{vid_idx+1}/{len(all_video_paths)}] Processed video: {os.path.basename(in_path)}")
@@ -4224,6 +5350,38 @@ def run ():
                         print (f"   [GPU] memory={mem_used:.2f}GB / {mem_total:.2f}GB")
 
                         # 
+        gid2disp_runtime =getattr (inference ,'global_to_display',{})
+        gstats_runtime =getattr (inference ,'global_gender_stats',{})
+        agestats_runtime =getattr (inference ,'global_age_stats',{})
+        final_merge_alias ={}
+        if bool (getattr (args ,'post_merge_enable_video',getattr (args ,'post_merge_enable',True ))):
+            final_merge_alias =_consolidate_runtime_identities (
+            inference =inference ,
+            candidate_gids =set (gid2disp_runtime .keys ())|set (gstats_runtime .keys ())|set (agestats_runtime .keys ()),
+            global_to_display =gid2disp_runtime ,
+            global_gender_stats =gstats_runtime ,
+            global_age_stats =agestats_runtime ,
+            args =args ,
+            gid_feature_map =None ,
+            id_root =getattr (inference ,'id_group_root',None )if getattr (inference ,'group_by_id',False )else None ,
+            log_prefix ="directory-post-merge-preimage",
+            )
+        if final_merge_alias :
+            detection_records =_remap_detection_records (detection_records ,gid2disp_runtime ,final_merge_alias )
+            remapped_video_summaries =[]
+            for name ,summ in video_summaries :
+                grouped ={}
+                for gid ,v in (summ or {}).items ():
+                    root_gid =_remap_gid_to_root (gid ,final_merge_alias )or gid 
+                    grouped [root_gid ]={
+                    'display_id':gid2disp_runtime .get (root_gid ,v .get ('display_id')or root_gid ),
+                    'gender':v .get ('gender'),
+                    'male_mean':v .get ('male_mean'),
+                    'gender_conf':v .get ('gender_conf'),
+                    'age_mean':v .get ('age_mean'),
+                    }
+                remapped_video_summaries .append ((name ,grouped ))
+            video_summaries =remapped_video_summaries
         total_vid_ids =sum (len (s [1 ])for s in video_summaries )
         print (f"[INFO] Video summaries: {len(video_summaries)} files, {total_vid_ids} unique IDs")
         for name ,summ in video_summaries :
@@ -4231,8 +5389,7 @@ def run ():
             for gid ,v in summ .items ():
                 age_str =f"{v['age_mean']:.1f}"if v ['age_mean']is not None else "-"
                 disp =v .get ('display_id')or gid 
-                gid_info =v .get ('gid')or gid 
-                print (f"    {disp} ({gid_info}): gender={v['gender']} (conf={float(v.get('gender_conf',0.0)):.2f}), age={age_str}")
+                print (f"    {disp} ({gid}): gender={v['gender']} (conf={float(v.get('gender_conf',0.0)):.2f}), age={age_str}")
 
                 # ==========  ==========
         img_count ,img_kept =0 ,0 
@@ -4247,10 +5404,6 @@ def run ():
             output_dir =output_dir ,
             all_image_paths =all_image_paths ,
             )
-            image_detection_records =[
-            (rel_path ,_compress_detection_id_records (records ,args ))
-            for rel_path ,records in image_detection_records
-            ]
             detection_records .extend (image_detection_records )
         else :
             for in_path in all_image_paths :
@@ -4268,7 +5421,6 @@ def run ():
                 try :
                     detected_records =run_image (args ,inference ,yolo ,sam_predictor ,device ,input_rel_path =rel_path )
                     if detected_records :
-                        detected_records =_compress_detection_id_records (detected_records ,args )
                         detection_records .append ((rel_path ,detected_records ))
                         note =""if bool (getattr (args ,'save_vis',True ))else "()"
                         print (f"{note}): {in_path}")
@@ -4283,17 +5435,72 @@ def run ():
                 img_count +=1 
 
             # D
+        gid2disp_runtime =getattr (inference ,'global_to_display',{})
+        gstats_runtime =getattr (inference ,'global_gender_stats',{})
+        agestats_runtime =getattr (inference ,'global_age_stats',{})
+        final_merge_alias ={}
+        _enable_dir_post_merge =False 
+        if len (all_image_paths )>0 and bool (getattr (args ,'post_merge_enable_image',getattr (args ,'post_merge_enable',True ))):
+            _enable_dir_post_merge =True 
+        if len (all_video_paths )>0 and bool (getattr (args ,'post_merge_enable_video',getattr (args ,'post_merge_enable',True ))):
+            _enable_dir_post_merge =True 
+        if _enable_dir_post_merge :
+            final_merge_alias =_consolidate_runtime_identities (
+            inference =inference ,
+            candidate_gids =set (gid2disp_runtime .keys ())|set (gstats_runtime .keys ())|set (agestats_runtime .keys ()),
+            global_to_display =gid2disp_runtime ,
+            global_gender_stats =gstats_runtime ,
+            global_age_stats =agestats_runtime ,
+            args =args ,
+            gid_feature_map =None ,
+            id_root =getattr (inference ,'id_group_root',None )if getattr (inference ,'group_by_id',False )else None ,
+            log_prefix ="directory-post-merge-final",
+            )
+        if final_merge_alias :
+            detection_records =_remap_detection_records (detection_records ,gid2disp_runtime ,final_merge_alias )
+
+        image_summary =[]
         gid2disp =getattr (inference ,'global_to_display',{})
         gstats =getattr (inference ,'global_gender_stats',{})
         agestats =getattr (inference ,'global_age_stats',{})
-        summary_gids =set (gid2disp .keys ())|set (gstats .keys ())|set (agestats .keys ())
-        image_summary =list (_aggregate_display_identity_summary (
-        gids =summary_gids ,
-        global_to_display =gid2disp ,
-        global_gender_stats =gstats ,
-        age_stats =agestats if getattr (args ,'age_scope','video')=='global'else {} ,
-        args =args ,
-        ).values ())
+        for gid ,stat in gstats .items ():
+            forced_meta =_ID_META .get (gid )
+            if forced_meta is not None :
+                gender =forced_meta .get ('gender')or 'F'
+                male_mean =1.0 if gender =='M'else 0.0 
+                try :
+                    age_mean =float (forced_meta .get ('age'))if forced_meta .get ('age')is not None else None 
+                except Exception :
+                    age_mean =None 
+                image_summary .append ({
+                'gid':gid ,
+                'display_id':gid2disp .get (gid ,gid ),
+                'gender':gender ,
+                'male_mean':male_mean ,
+                'gender_conf':_gender_confidence_01 (male_mean ,stable_gender =gender ,threshold =args .gender_threshold ),
+                'age_mean':age_mean ,
+                })
+                continue 
+
+            total =stat ['alpha_male']+stat ['alpha_female']
+            male_mean =float (stat ['alpha_male']/max (1e-6 ,total ))
+            gender =stat .get ('stable_gender')or ('M'if male_mean >=args .gender_threshold else 'F')
+            ages =agestats .get (gid ,[])
+            # 
+            
+            
+            if getattr (args ,'age_scope','video')=='global':
+                age_mean =float (np .mean (ages ))if len (ages )>0 else None 
+            else :
+                age_mean =None 
+            image_summary .append ({
+            'gid':gid ,
+            'display_id':gid2disp .get (gid ,''),
+            'gender':gender ,
+            'male_mean':male_mean ,
+            'gender_conf':_gender_confidence_01 (male_mean ,stable_gender =gender ,threshold =args .gender_threshold ),
+            'age_mean':age_mean ,
+            })
 
         print (f" {img_count}  {img_kept} {output_dir}")
         print (f"[INFO] Image ID summary count: {len(image_summary)}")
@@ -4302,15 +5509,46 @@ def run ():
         gid2disp =getattr (inference ,'global_to_display',{})
         gstats =getattr (inference ,'global_gender_stats',{})
         agestats =getattr (inference ,'global_age_stats',{})
-        final_summary =list (_aggregate_display_identity_summary (
-        gids =summary_gids ,
-        global_to_display =gid2disp ,
-        global_gender_stats =gstats ,
-        age_stats =agestats if getattr (args ,'age_scope','video')=='global'else {} ,
-        args =args ,
-        ).values ())
+        final_summary =[]
+        for gid ,stat in gstats .items ():
+            forced_meta =_ID_META .get (gid )
+            if forced_meta is not None :
+                gender =forced_meta .get ('gender')or 'F'
+                male_mean =1.0 if gender =='M'else 0.0 
+                try :
+                    age_mean =float (forced_meta .get ('age'))if forced_meta .get ('age')is not None else None 
+                except Exception :
+                    age_mean =None 
+                final_summary .append ({
+                'gid':gid ,
+                'display_id':gid2disp .get (gid ,gid ),
+                'gender':gender ,
+                'male_mean':male_mean ,
+                'gender_conf':_gender_confidence_01 (male_mean ,stable_gender =gender ,threshold =args .gender_threshold ),
+                'age_mean':age_mean ,
+                })
+                continue 
+
+            total =stat ['alpha_male']+stat ['alpha_female']
+            male_mean =float (stat ['alpha_male']/max (1e-6 ,total ))
+            gender =stat .get ('stable_gender')or ('M'if male_mean >=args .gender_threshold else 'F')
+            ages =agestats .get (gid ,[])
+            
+            
+            if getattr (args ,'age_scope','video')=='global':
+                age_mean =float (np .mean (ages ))if len (ages )>0 else None 
+            else :
+                age_mean =None 
+            final_summary .append ({
+            'gid':gid ,
+            'display_id':gid2disp .get (gid ,''),
+            'gender':gender ,
+            'male_mean':male_mean ,
+            'gender_conf':_gender_confidence_01 (male_mean ,stable_gender =gender ,threshold =args .gender_threshold ),
+            'age_mean':age_mean ,
+            })
         print ("[INFO] Final identity summary count: {} IDs".format (len (final_summary )))
-        for it in sorted (final_summary ,key =lambda x :_sort_display_id_key (x ['display_id']or x ['gid'])):
+        for it in sorted (final_summary ,key =lambda x :x ['display_id']or x ['gid']):
             age_str =f"{it['age_mean']:.1f}"if it ['age_mean']is not None else "-"
             disp =it ['display_id']or it ['gid']
             print (f"  {disp} ({it['gid']}): gender={it['gender']} (conf={it.get('gender_conf',0.0):.2f}), age={age_str}")
@@ -4318,7 +5556,24 @@ def run ():
             
             
         detail_rows =getattr (inference ,'_last_detection_details',None )
-        dir_run_summary =getattr (inference ,'_last_directory_run_summary',{})or {} 
+        dir_run_summary =getattr (inference ,'_last_directory_run_summary',{})or {}
+        identity_feature_summary ={}
+        try :
+            feat_store =_identity_gid_features_store (inference )
+            gid2disp_for_feat =getattr (inference ,'global_to_display',{})or {}
+            for _gid ,_feat in (feat_store or {}).items ():
+                _arr =np .asarray (_feat ,dtype =np .float32 ).reshape (-1 )
+                if _arr .size <=0 :
+                    continue 
+                _norm =float (np .linalg .norm (_arr ))
+                if np .isfinite (_norm )and _norm >0 :
+                    _arr =_arr /_norm 
+                identity_feature_summary [str (_gid )]={
+                'display_id':str (gid2disp_for_feat .get (_gid ,_gid )),
+                'feature':_arr .astype (float ).tolist (),
+                }
+        except Exception as _feat_e :
+            identity_feature_summary ={'_error':str (_feat_e )}
         try :
             json_payload =save_folder_level_metrics (
             output_dir ,
@@ -4329,6 +5584,7 @@ def run ():
             'img_kept':int (img_kept ),
             'image_id_summary_count':int (len (image_summary )),
             'final_identity_summary_count':int (len (final_summary )),
+            'identity_feature_summary':identity_feature_summary ,
             **dir_run_summary ,
             },
             )
@@ -4525,7 +5781,7 @@ def run ():
     elif not _HAS_SAM :
         print ("[WARN] segment_anything not available, SAM refinement is disabled.")
     else :
-        sam_ckpt =os .path .join (os .path .dirname (__file__ ),'SAMmodel','sam_vit_h_4b8939.pth')
+        sam_ckpt =os .path .join (PROJECT_ROOT ,'weights','sam_vit_h_4b8939.pth')
         if not os .path .isfile (sam_ckpt ):
             print (f"[WARN] SAM checkpoint missing: {sam_ckpt}; SAM refinement disabled.")
         else :
@@ -4643,6 +5899,7 @@ def run ():
     persist =True ,
     verbose =False ,
     workers =0 ,
+    vid_stride =int (getattr (args ,'vid_stride',1 )or 1 ),
     )
 
     for result in results_gen :
@@ -4931,13 +6188,6 @@ def run ():
         if ft_info .get ('global_id'):
             unique_gids .add (ft_info ['global_id'])
     print (f"[INFO] Unique IDs: {len(unique_gids)}, finalized tracks: {len(finalized_tracks)}")
-    merged_display_stats =_aggregate_display_identity_summary (
-    gids =unique_gids ,
-    global_to_display =global_to_display ,
-    global_gender_stats =global_gender_stats ,
-    age_stats =global_age_stats ,
-    args =args ,
-    )
 
     if not save_vis :
         if getattr (args ,'verbose',False ):
@@ -5053,12 +6303,16 @@ def run ():
                 color =_VIS_BOX_BGR 
                 cv2 .rectangle (frame_bgr ,(x1 ,y1 ),(x2 ,y2 ),color ,2 )
 
+                # 
+                disp =[]
+
+                # ID
                 if ft_info and ft_info .get ('display_id'):
-                    disp_id =ft_info ['display_id']
+                    disp .append (ft_info ['display_id'])
                 elif state and state .get ('display_id'):
-                    disp_id =state ['display_id']
+                    disp .append (state ['display_id'])
                 else :
-                    disp_id =f"ID{tid}"
+                    disp .append (f"ID{tid}")
 
                     
                 gid =None 
@@ -5067,18 +6321,18 @@ def run ():
                 elif state :
                     gid =state .get ('global_id')
 
-                gender =None 
-                gender_conf =None 
                 if gid and gid in global_gender_stats :
                     gstat =global_gender_stats [gid ]
                     total =gstat ['alpha_male']+gstat ['alpha_female']
                     male_mean =float (gstat ['alpha_male']/max (1e-6 ,total ))
                     gender ='M'if male_mean >=args .gender_threshold else 'F'
                     gender_conf =_gender_confidence_01 (male_mean ,stable_gender =gender ,threshold =args .gender_threshold )
+                    disp .append (f"{gender}_conf:{gender_conf :.2f}")
                 elif state and len (state .get ('male_hist',[]))>0 :
                     mp =float (np .mean (state ['male_hist']))
                     gender ='M'if mp >=args .gender_threshold else 'F'
                     gender_conf =_gender_confidence_01 (mp ,stable_gender =gender ,threshold =args .gender_threshold )
+                    disp .append (f"{gender}_conf:{gender_conf :.2f}")
 
                     # 
                 age_txt =None 
@@ -5088,6 +6342,9 @@ def run ():
                 elif state and len (state .get ('age_hist',[]))>0 :
                     ages =state ['age_hist']
                     age_txt =float (np .median (ages ))
+
+                if age_txt is not None :
+                    disp .append (f"Age:{age_txt:.0f}")
 
                     
                 sim_val =None 
@@ -5103,21 +6360,11 @@ def run ():
                     id_conf =float (state ['last_id_confidence'])
                 elif sim_val is not None :
                     id_conf =_identity_confidence_01 (sim_val ,adaptive_th =getattr (args ,'base_threshold',None ),is_new =False )
-                vis_disp_id =_customize_disp_id (disp_id ,args )
-                merged_stat =merged_display_stats .get (vis_disp_id ,{})
-                if merged_stat :
-                    gender =merged_stat .get ('gender',gender )
-                    gender_conf =merged_stat .get ('gender_conf',gender_conf )
-                    age_txt =merged_stat .get ('age_mean',age_txt )
 
-                txt =_build_vis_text (
-                args =args ,
-                disp_id =disp_id ,
-                gender =gender ,
-                gender_conf =gender_conf ,
-                age =age_txt ,
-                id_conf =id_conf ,
-                )
+                if id_conf is not None :
+                    disp .append (f"id_conf:{id_conf :.2f}")
+
+                txt =' | '.join (disp )
 
                 
                 font ,font_scale ,thickness ,pad_txt =_get_adaptive_text_style (
